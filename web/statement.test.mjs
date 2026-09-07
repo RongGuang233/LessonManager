@@ -232,3 +232,87 @@ test('新账未知金额不能显示精确当前余额或零退款、零调整',
  assert.match(result.text,/本期调整：1 笔金额待核对/);
  assert.doesNotMatch(result.text,/本期退款：¥0|本期调整：¥0|当前已确认余额|期初结余|期末结余/);
 });
+
+test('正负历史收款核对计入净收款，保留原缴费退款含义及展示符号',()=>{
+ for(const [correction, displayed, net] of [[2000,'+¥20.00','¥470.00'],[-2000,'-¥20.00','¥430.00']]) {
+   const state=base();
+   state.payments=[payment('paid','2026-09-01',50000),payment('returned','2026-09-02',-5000,'refund'),payment('adjusted','2026-09-03',3000,'adjustment'),payment('checked','2026-09-04',correction,'receipt_correction')];
+   const result=buildStatement(state,'s1','2026-09-01','2026-09-30');
+   assert.equal(result.summary.paymentCents,50000);
+   assert.equal(result.summary.refundCents,5000);
+   assert.equal(result.summary.adjustmentCents,3000);
+   assert.equal(result.summary.receiptCorrectionCents,correction);
+   assert.equal(result.summary.unknownReceiptCorrectionAmounts,0);
+   assert.equal(result.summary.netReceivedCents,45000+correction);
+   assert.equal(result.entries.find(e=>e.id==='checked').label,'历史收款核对');
+   assert.ok(result.text.includes(`历史收款核对：${displayed}`));
+   assert.ok(result.text.includes(`历史收款核对 ${displayed}`));
+   assert.ok(result.html.includes(`<strong>${displayed}</strong>`));
+   assert.ok(result.text.includes(`核对后净收款：${net}`));
+   assert.match(result.text,/本期原缴费：¥500\.00/);
+   assert.match(result.text,/本期退款：¥50\.00/);
+   assert.match(result.text,/不代表本期新增收款/);
+ }
+});
+
+test('未知历史收款核对保持未知，净收款只汇总已知金额并提示',()=>{
+ const state=base();
+ state.payments=[payment('paid','2026-09-01',10000),payment('known','2026-09-02',-2000,'receipt_correction'),payment('unknown','2026-09-03',null,'receipt_correction')];
+ const result=buildStatement(state,'s1','2026-09-01','2026-09-30');
+ assert.equal(result.summary.receiptCorrectionCents,-2000);
+ assert.equal(result.summary.unknownReceiptCorrectionAmounts,1);
+ assert.equal(result.summary.netReceivedCents,8000);
+ assert.equal(result.summary.currentBalanceCents,null);
+ assert.equal(result.entries.find(e=>e.id==='unknown').amount,null);
+ assert.match(result.text,/历史收款核对：已知 -¥20\.00，另有 1 笔金额待核对/);
+ assert.match(result.text,/核对后净收款：已知 ¥80\.00，另有 1 笔金额待核对/);
+ assert.match(result.text,/待核对金额未计入合计/);
+ state.payments=[payment('unknown-only','2026-09-03',null,'receipt_correction')];
+ const onlyUnknown=buildStatement(state,'s1','2026-09-01','2026-09-30');
+ assert.match(onlyUnknown.text,/历史收款核对：1 笔金额待核对/);
+ assert.match(onlyUnknown.text,/核对后净收款：1 笔金额待核对/);
+});
+
+test('已结转正负核对不改变确认余额及新账，历史范围仍统计收款差额',()=>{
+ for(const balance of [60000,-8000]) {
+   const state=settledState();
+   state.students[0].settlement.balance_cents=balance;
+   state.students[0].settlement.payment_ids.push('corrected-before','corrected-same-day','corrected-undated');
+   state.payments.push(payment('corrected-before','2026-09-02',3000,'receipt_correction'),payment('corrected-same-day','2026-09-08',-1000,'receipt_correction'),payment('corrected-undated',null,null,'receipt_correction'));
+   const before=structuredClone(state);
+   const current=buildStatement(state,'s1','2026-09-08','2026-09-30');
+   assert.equal(current.summary.currentBalanceCents,balance+5000);
+   assert.equal(current.summary.openingCents,balance);
+   assert.equal(current.summary.closingCents,balance+5000);
+   assert.equal(current.summary.receiptCorrectionCents,-1000);
+   assert.equal(current.summary.netReceivedCents,24000);
+   assert.equal(current.entries.find(e=>e.id==='corrected-same-day').balance,null);
+   assert.equal(current.entries.find(e=>e.id==='corrected-same-day').settled,true);
+   assert.doesNotMatch(current.text,/日期待核对记录/);
+   const later=buildStatement(state,'s1','2026-09-10','2026-09-30');
+   assert.equal(later.summary.openingCents,balance-20000);
+   assert.equal(later.summary.closingCents,balance+5000);
+   assert.equal(later.summary.receiptCorrectionCents,0);
+   assert.equal(later.summary.netReceivedCents,25000);
+   assert.doesNotMatch(later.text,/历史收款核对|核对后净收款/);
+   const historical=buildStatement(state,'s1','2026-09-01','2026-09-30');
+   assert.equal(historical.summary.receiptCorrectionCents,2000);
+   assert.equal(historical.summary.paymentCents,35000);
+   assert.equal(historical.summary.netReceivedCents,37000);
+   assert.equal(historical.summary.currentBalanceCents,balance+5000);
+   assert.equal(historical.summary.closingCents,null);
+   assert.deepEqual(state,before);
+ }
+});
+
+test('正负核对相抵为零保留逐笔符号，汇总不显示多余零差额',()=>{
+ const state=base();
+ state.payments=[payment('plus','2026-09-01',1000,'receipt_correction'),payment('minus','2026-09-02',-1000,'receipt_correction')];
+ const result=buildStatement(state,'s1','2026-09-01','2026-09-30');
+ assert.equal(result.summary.receiptCorrectionCents,0);
+ assert.equal(result.summary.netReceivedCents,0);
+ assert.match(result.text,/历史收款核对 \+¥10\.00/);
+ assert.match(result.text,/历史收款核对 -¥10\.00/);
+ assert.doesNotMatch(result.text,/历史收款核对：/);
+ assert.match(result.text,/核对后净收款：¥0\.00/);
+});

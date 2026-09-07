@@ -1,6 +1,6 @@
 import {accountEntries, esc, money, hours} from './utils.js';
 
-const labels = {payment:'缴费', refund:'退款', adjustment:'余额调整', course:'课程扣费', settlement:'历史余额结转'};
+const labels = {payment:'缴费', refund:'退款', adjustment:'余额调整', receipt_correction:'历史收款核对', course:'课程扣费', settlement:'历史余额结转'};
 const integer = value => Number.isSafeInteger(value);
 const validDate = value => typeof value === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(value) && !Number.isNaN(Date.parse(value)) && new Date(`${value}T12:00:00Z`).toISOString().slice(0,10) === value;
 const sum = values => values.reduce((total, value) => {
@@ -36,7 +36,8 @@ export function buildStatement(state, studentId, start, end) {
     const rows = within.filter(entry => entry.type === type);
     return {cents:sum(rows.filter(entry => entry.amount != null).map(entry => type === 'course' || type === 'refund' ? -entry.amount : entry.amount)), unknown:rows.filter(entry => entry.amount == null).length};
   };
-  const payment = totalsFor('payment'), refund = totalsFor('refund'), adjustment = totalsFor('adjustment'), fee = totalsFor('course');
+  const payment = totalsFor('payment'), refund = totalsFor('refund'), adjustment = totalsFor('adjustment'), receiptCorrection = totalsFor('receipt_correction'), fee = totalsFor('course');
+  const hasReceiptCorrections = within.some(entry => entry.type === 'receipt_correction');
   const courses = within.filter(entry => entry.type === 'course');
   const knownMinutes = sum(courses.filter(entry => integer(entry.record.actual_minutes) && entry.record.actual_minutes >= 0).map(entry => entry.record.actual_minutes));
   const unknownMinutes = courses.filter(entry => !integer(entry.record.actual_minutes) || entry.record.actual_minutes < 0).length;
@@ -45,9 +46,9 @@ export function buildStatement(state, studentId, start, end) {
     openingCents:balanceReliable ? recordedOpeningCents : null,
     closingCents:balanceReliable ? recordedClosingCents : null,
     recordedOpeningCents, recordedClosingCents,
-    paymentCents:payment.cents, refundCents:refund.cents, adjustmentCents:adjustment.cents, feeCents:fee.cents,
-    netReceivedCents:sum([payment.cents, -refund.cents]), knownMinutes, unknownMinutes,
-    unknownPaymentAmounts:payment.unknown, unknownRefundAmounts:refund.unknown, unknownAdjustmentAmounts:adjustment.unknown, unknownFeeAmounts:fee.unknown,
+    paymentCents:payment.cents, refundCents:refund.cents, adjustmentCents:adjustment.cents, receiptCorrectionCents:receiptCorrection.cents, feeCents:fee.cents,
+    netReceivedCents:sum([payment.cents, -refund.cents, receiptCorrection.cents]), knownMinutes, unknownMinutes,
+    unknownPaymentAmounts:payment.unknown, unknownRefundAmounts:refund.unknown, unknownAdjustmentAmounts:adjustment.unknown, unknownReceiptCorrectionAmounts:receiptCorrection.unknown, unknownFeeAmounts:fee.unknown,
     entryCount:within.length, courseCount:courses.length, undatedCount:undatedSource.length,
     beforeCount:before.length, afterCount:after.length,
   };
@@ -63,7 +64,8 @@ export function buildStatement(state, studentId, start, end) {
   if (within.some(entry => entry.settled)) notices.push(`标注“已结转”的旧账已纳入 ${settlement.confirmed_on} 确认结余，不重复影响当前余额。`);
   const visibleUndated = undatedSource.filter(entry => !entry.settled);
   if (visibleUndated.length) notices.push(`${visibleUndated.length} 笔日期待核对记录未计入本期合计。`);
-  if (payment.unknown + refund.unknown + adjustment.unknown + fee.unknown) notices.push('待核对金额未计入合计。');
+  if (payment.unknown + refund.unknown + adjustment.unknown + receiptCorrection.unknown + fee.unknown) notices.push('待核对金额未计入合计。');
+  if (hasReceiptCorrections) notices.push('历史收款核对是旧收款记录的差额；核对后净收款为原缴费减退款，加核对差额，不代表本期新增收款。');
   const displayEntry = (entry, balance) => {
     const course = entry.type === 'course';
     const duration = integer(entry.record.actual_minutes) && entry.record.actual_minutes >= 0 ? entry.record.actual_minutes : null;
@@ -83,14 +85,16 @@ export function buildStatement(state, studentId, start, end) {
     return displayEntry(entry, entry.type === 'settlement' ? settlement.balance_cents : balanceReliable && !entry.settled ? running : null);
   });
   const undated = undatedSource.map(entry => displayEntry(entry, null));
-  const totalValue = total => total.unknown
-    ? `${total.cents ? `已知 ${money(total.cents)}，另有 ` : ''}${total.unknown} 笔金额待核对`
-    : money(total.cents);
+  const totalValue = (total, format = money) => total.unknown
+    ? `${total.cents ? `已知 ${format(total.cents)}，另有 ` : ''}${total.unknown} 笔金额待核对`
+    : format(total.cents);
   const metrics = [
-    ['本期收款', totalValue(payment)],
+    [hasReceiptCorrections ? '本期原缴费' : '本期收款', totalValue(payment)],
     ['本期上课', `${courses.length} 次 · ${unknownMinutes ? `${knownMinutes ? `已知 ${hours(knownMinutes)}，` : ''}${unknownMinutes} 次时长待核对` : hours(knownMinutes)}`],
     ['本期扣费', totalValue(fee)],
     ...(refund.cents || refund.unknown ? [['本期退款', totalValue(refund)]] : []),
+    ...(receiptCorrection.cents || receiptCorrection.unknown ? [['历史收款核对', totalValue(receiptCorrection, signedMoney)]] : []),
+    ...(hasReceiptCorrections ? [['核对后净收款', totalValue({cents:summary.netReceivedCents, unknown:payment.unknown + refund.unknown + receiptCorrection.unknown})]] : []),
     ...(adjustment.cents || adjustment.unknown ? [['本期调整', totalValue(adjustment)]] : []),
   ];
   const currentLabel = currentBalanceReliable ? (currentBalanceCents < 0 ? '当前已确认欠费' : '当前已确认余额') : '当前余额待核对';
@@ -99,7 +103,7 @@ export function buildStatement(state, studentId, start, end) {
   const parentEntries = entries.filter(entry => entry.type !== 'settlement');
   const parentUndated = undated.filter(entry => !entry.settled);
   const amountLabel = entry => entry.type === 'course' ? '扣费' : entry.type === 'payment' ? '收款' : labels[entry.type] || '金额';
-  const entryAmount = entry => entry.amount == null ? '待核对' : entry.type === 'adjustment' ? signedMoney(entry.amount) : money(Math.abs(entry.amount));
+  const entryAmount = entry => entry.amount == null ? '待核对' : entry.type === 'adjustment' || entry.type === 'receipt_correction' ? signedMoney(entry.amount) : money(Math.abs(entry.amount));
   const lineFor = entry => [entry.date || '日期待核对', entry.time, entry.label, entry.subject,
     entry.type === 'course' ? entry.detail : '', `${amountLabel(entry)} ${entryAmount(entry)}`,
     entry.settled ? '已结转' : '', entry.needsReview ? '记录待核对' : ''].filter(Boolean).join(' · ');

@@ -6,7 +6,7 @@ GET /api/state → {students,courses,payments,reviews,periods,meta}
 
 - student: {id,name,status:"active"|"paused"|"archived",grade,notes,rates:{"数学":15000,"物理":15000},balance_verified:boolean,balance_cents,completed_minutes,paid_cents,charged_cents,pending_count,settlement:null|{confirmed_on,balance_cents,note,course_ids,payment_ids}}
 - course: {id,student_id,subject,date,start_time,duration_minutes,actual_minutes,hourly_rate_cents,status:"scheduled"|"completed"|"cancelled",notes,series_id,source,needs_review:boolean,fee_cents,conflict:boolean}; source 为文本或空字符串。fee_cents由后端计算，未知费用为null。取消/未上费用为0。
-- payment: {id,student_id,date,kind:"payment"|"refund"|"adjustment",amount_cents,notes,source}; 退款金额为负。
+- payment: {id,student_id,date,kind:"payment"|"refund"|"adjustment"|"receipt_correction",amount_cents,notes,source}; 退款金额为负。receipt_correction 为有依据的历史收款核对差额（可正可负），计入历史净收款，不代表新发生的缴费或退款；纳入已结清 payment_ids 后不重复改变当前余额。
 - review: {id,student_id,course_id,kind,message,source,status:"pending"|"resolved",resolution}; 不确定的旧数据不能默认当作零金额或已完成。
 - period: {id,name,start,end}
 - meta: {data_dir,last_backup_at,imported_at,app_version}

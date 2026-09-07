@@ -62,3 +62,18 @@ test('正负历史余额结转只作为起点，不制造现金流水',()=>{
    assert.doesNotMatch(ledger.dated[0].notes,/结清|结余为零/);
  }
 });
+
+test('历史收款核对差额计入净收款，正负保留，按学生和日期筛选',()=>{
+ const state={courses:[],payments:[
+  {id:'p',student_id:'s',date:'2025-08-01',kind:'payment',amount_cents:10000},
+  {id:'r',student_id:'s',date:'2025-08-01',kind:'refund',amount_cents:-2000},
+  {id:'c1',student_id:'s',date:'2025-08-02',kind:'receipt_correction',amount_cents:7000},
+  {id:'c2',student_id:'s',date:'2025-08-03',kind:'receipt_correction',amount_cents:-1000},
+  {id:'a',student_id:'s',date:'2025-08-03',kind:'adjustment',amount_cents:500},
+  {id:'other',student_id:'other',date:'2025-08-03',kind:'receipt_correction',amount_cents:9000},
+  {id:'later',student_id:'s',date:'2025-09-03',kind:'receipt_correction',amount_cents:4000},
+ ]};
+ const result=statsFor(state,'2025-08-01','2025-08-31','s');
+ assert.equal(result.received,14000);assert.equal(result.receiptCorrection,6000);assert.equal(result.adjusted,500);
+ assert.equal(accountEntries(state,'s').dated.find(e=>e.id==='c2').amount,-1000);
+});

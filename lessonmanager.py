@@ -18,7 +18,7 @@ from urllib.request import urlopen
 import webbrowser
 from contextlib import closing, contextmanager
 
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 ROOT = Path(__file__).resolve().parent
 DEFAULT_DATA_DIR = Path.home() / "Library" / "Application Support" / "LessonManager"
 TABLES = ("students", "courses", "payments", "reviews", "periods")
@@ -147,7 +147,7 @@ def normalize_record(table, raw, historical=False):
     elif table == "payments":
         record["date"] = require_date(record["date"], optional=historical)
         record["kind"] = record["kind"] or "payment"
-        if record["kind"] not in ("payment", "refund", "adjustment"):
+        if record["kind"] not in ("payment", "refund", "adjustment", "receipt_correction"):
             raise AppError("款项类型不正确")
         record["amount_cents"] = integer(record["amount_cents"], "金额（分）")
         if record["kind"] == "refund":

@@ -28,6 +28,24 @@ class StoreTests(unittest.TestCase):
     def balance(self):
         return next(s for s in self.store.state()["students"] if s["id"] == self.student["id"])["balance_cents"]
 
+    def test_signed_historical_receipt_corrections_restore_and_settle(self):
+        sid = self.student["id"]
+        positive = self.call("POST", "/api/payments", {"student_id": sid, "date": "2025-08-01",
+            "kind": "receipt_correction", "amount_cents": 18000, "notes": "虚构旧账收款漏记核对"})
+        negative = self.call("POST", "/api/payments", {"student_id": sid, "date": "2025-08-02",
+            "kind": "receipt_correction", "amount_cents": -3000, "notes": "虚构旧账收款多计核对"})
+        self.assertEqual(self.balance(), 15000)
+        self.assertEqual(negative["amount_cents"], -3000)
+        self.call("POST", f"/api/students/{sid}/settle-history", {
+            "course_ids": [], "payment_ids": [positive["id"], negative["id"]], "note": "老师确认旧账结清"})
+        self.call("POST", "/api/payments", {"student_id": sid, "date": "2099-09-12", "amount_cents": 28000})
+        self.call("PATCH", f"/api/payments/{negative['id']}", {"amount_cents": -5000})
+        doc = self.store.export()
+        self.store.restore(doc)
+        self.assertEqual(self.balance(), 28000)
+        corrections = [p for p in self.store.state()["payments"] if p["kind"] == "receipt_correction"]
+        self.assertEqual(sorted(p["amount_cents"] for p in corrections), [-5000, 18000])
+
     def test_settled_history_preserves_unknowns_and_only_new_work_changes_balance(self):
         doc = self.store.export()
         sid = self.student["id"]
