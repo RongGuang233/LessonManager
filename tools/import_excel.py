@@ -250,7 +250,7 @@ class Importer:
             self.data["courses"].extend(lower)
             dates = [c["date"] for c in lower if c["date"]]
             if dates:
-                self.data["periods"].append(dict(id=stable_id("period", path.name + sheet.title), name=path.stem, start=min(dates), end=max(dates)))
+                self.data["periods"].append(dict(id=stable_id("period", path.name + sheet.title), name=path.stem, start=min(dates), end=max(dates), range_kind="coverage", source_start=min(dates), source_end=max(dates)))
         workbook.close()
 
     @staticmethod

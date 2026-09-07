@@ -51,6 +51,20 @@ class HttpTests(unittest.TestCase):
             error = json.load(response)
         self.assertIn("缺少", error["error"])
 
+    def test_copy_preview_and_period_source_range_over_http(self):
+        student = self.request("/api/students", "POST", {"name": "复制示例"})
+        self.request("/api/courses", "POST", {"student_id": student["id"], "subject": "数学", "date": "2026-09-07", "start_time": "18:00", "duration_minutes": 120})
+        body = {"week_start": "2026-09-14", "student_id": student["id"], "status": "scheduled", "preview": True}
+        preview = self.request("/api/courses/copy-week", "POST", body)
+        self.assertEqual(len(self.request("/api/state")["courses"]), 1)
+        self.assertEqual(preview["created"][0]["date"], "2026-09-14")
+        result = self.request("/api/courses/copy-week", "POST", dict(body, preview=False))
+        self.assertIsInstance(result["created"][0], str)
+        self.assertEqual(len(self.request("/api/state")["courses"]), 2)
+        period = self.request("/api/periods", "POST", {"name": "导入日期", "start": "2026-09-07", "end": "2026-10-28", "range_kind": "coverage", "source_start": "2026-09-07", "source_end": "2026-10-28"})
+        period = self.request(f"/api/periods/{period['id']}", "PATCH", {"range_kind": "term", "start": "2026-09-01", "end": "2027-01-31"})
+        self.assertEqual((period["range_kind"], period["source_start"], period["source_end"]), ("term", "2026-09-07", "2026-10-28"))
+
     def test_historical_review_cannot_hide_missing_date_over_http(self):
         student = self.request("/api/students", "POST", {"name": "历史核对示例"})
         backup = self.request("/api/backup")

@@ -12,12 +12,42 @@ export function attentionFor(student, courses, date = today()) {
   const expected = next ? estimatedFee(next, student) : null;
   return expected != null && student.balance_cents < expected ? 'low' : 'normal';
 }
+export function courseChangePayload(course, form) {
+  const payload = {date:form.date || null};
+  if (form.start_time !== undefined && (form.start_time || null) !== (course.start_time || null)) payload.start_time = form.start_time || null;
+  if (form.duration_hours !== undefined) {
+    const duration = Math.round(Number(form.duration_hours) * 60);
+    if (duration !== course.duration_minutes) payload.duration_minutes = duration;
+  }
+  if (form.notes !== undefined && form.notes !== (course.notes ?? '')) payload.notes = form.notes;
+  return payload;
+}
+
+export function contextualStudentId(route, {selectedStudent, filterStudent, statsStudent}, students) {
+  const id = route === 'students' ? selectedStudent : route === 'schedule' ? filterStudent : route === 'stats' ? statsStudent : '';
+  return id && students.some(student => student.id === id) ? id : '';
+}
+
+const plannerViewKey = 'lesson-manager.planner-view';
+const plannerViews = ['list', 'week', 'month'];
+export function readPlannerView(storage) {
+  try {
+    const view = storage?.getItem(plannerViewKey);
+    return plannerViews.includes(view) ? view : 'list';
+  } catch { return 'list'; }
+}
+export function savePlannerView(storage, view) {
+  if (!plannerViews.includes(view)) return;
+  try { storage?.setItem(plannerViewKey, view); } catch { /* View preferences are optional. */ }
+}
+
 export function plannedChanges(courses, course, form) {
   if (course) {
     const following = form.scope === 'following' && course.series_id && course.status === 'scheduled' && course.date;
     const originals = following ? courses.filter(c => c.series_id === course.series_id && c.date >= course.date && c.status === 'scheduled') : [course];
     const shift = course.date && form.date ? Math.round((new Date(form.date+'T12:00:00') - new Date(course.date+'T12:00:00')) / 86400000) : 0;
-    return originals.map(c => ({...c, date:following ? addDays(c.date, shift) : form.date, start_time:form.start_time, duration_minutes:Number(form.duration_hours)*60}));
+    const payload = courseChangePayload(course, form);
+    return originals.map(c => ({...c, ...payload, date:following ? addDays(c.date, shift) : payload.date}));
   }
   if (!form.date || !form.start_time) return [];
   const end = form.repeat_until || form.date;

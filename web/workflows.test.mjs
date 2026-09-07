@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {attentionFor, plannedChanges, scheduleConflicts, estimatedFee} from './workflows.js';
+import {attentionFor, plannedChanges, scheduleConflicts, estimatedFee, courseChangePayload, contextualStudentId, readPlannerView, savePlannerView} from './workflows.js';
 const student={id:'s',status:'active',rates:{数学:15000,物理:20000},balance_verified:true,balance_cents:35000};
 const c={id:'c',student_id:'s',subject:'物理',date:'2026-09-07',start_time:'18:00',duration_minutes:120,status:'scheduled',series_id:'series'};
 test('余额按下一节课的科目价格判断，不混用统一小时价',()=>{
@@ -15,6 +15,70 @@ test('系列预览只修改本次及以后待上课程，跨日并保留已完�
  const changes=plannedChanges(list,c,{date:'2026-09-08',start_time:'19:00',duration_hours:'1',scope:'following'});
  assert.deepEqual(changes.map(x=>x.date),['2026-09-08','2026-09-15']);
  assert.equal(changes[0].duration_minutes,60);
+});
+test('仅调整系列日期时保留后续课程各自时间、时长和备注',()=>{
+ const original={...c,notes:'首节备注'};
+ const exception={...c,id:'d',date:'2026-09-14',start_time:'19:30',duration_minutes:60,notes:'后续单独备注'};
+ const form={date:'2026-09-09',start_time:'18:00',duration_hours:'2',notes:'首节备注',scope:'following'};
+ assert.deepEqual(courseChangePayload(original,form),{date:'2026-09-09'});
+ const changes=plannedChanges([original,exception],original,form);
+ assert.deepEqual(changes,[{...original,date:'2026-09-09'},{...exception,date:'2026-09-16'}]);
+ assert.equal(exception.date,'2026-09-14');
+});
+test('明确改变的系列字段传播到后续待上课程，包括清空备注',()=>{
+ const original={...c,notes:'需清空'};
+ const exception={...c,id:'d',date:'2026-09-14',start_time:'19:30',duration_minutes:60,notes:'后续单独备注'};
+ const completed={...c,id:'done',date:'2026-09-21',status:'completed',notes:'已上课'};
+ const form={date:c.date,start_time:'20:00',duration_hours:'1.5',notes:'',scope:'following'};
+ assert.deepEqual(courseChangePayload(original,form),{date:c.date,start_time:'20:00',duration_minutes:90,notes:''});
+ const changes=plannedChanges([original,exception,completed],original,form);
+ assert.deepEqual(changes.map(x=>[x.id,x.date,x.start_time,x.duration_minutes,x.notes]),[
+  ['c','2026-09-07','20:00',90,''],['d','2026-09-14','20:00',90,'']
+ ]);
+ const notesOnly=plannedChanges([original,exception],original,{...form,start_time:'18:00',duration_hours:'2'});
+ assert.equal(notesOnly[1].start_time,'19:30');
+ assert.equal(notesOnly[1].duration_minutes,60);
+ assert.equal(notesOnly[1].notes,'');
+});
+test('单节编辑与系列共用比较规则，未知日期时间归一化，未提供备注保留',()=>{
+ assert.deepEqual(courseChangePayload({...c,date:null,start_time:null},{date:'',start_time:'',duration_hours:2}),{date:null});
+ assert.deepEqual(courseChangePayload(c,{date:'',start_time:''}),{date:null,start_time:null});
+ assert.deepEqual(courseChangePayload({...c,notes:'保留'},{date:c.date,notes:undefined}),{date:c.date});
+ assert.deepEqual(courseChangePayload(c,{date:c.date,notes:''}),{date:c.date});
+ const original={...c,notes:'保留'};
+ assert.deepEqual(plannedChanges([original],original,{date:'',start_time:'',duration_hours:'1.3333333333',scope:'one'}),[
+  {...original,date:null,start_time:null,duration_minutes:80}
+ ]);
+});
+test('付款学生上下文仅属于当前页面，不沿用其它页面或默认第一位',()=>{
+ const students=[student,{...student,id:'second'}];
+ const context={selectedStudent:'s',filterStudent:'second',statsStudent:'s'};
+ assert.equal(contextualStudentId('students',context,students),'s');
+ assert.equal(contextualStudentId('schedule',context,students),'second');
+ assert.equal(contextualStudentId('stats',context,students),'s');
+ for(const route of ['settings','reviews','unknown','']) assert.equal(contextualStudentId(route,context,students),'');
+ assert.equal(contextualStudentId('schedule',{...context,filterStudent:''},students),'');
+ assert.equal(contextualStudentId('students',{...context,selectedStudent:'deleted'},students),'');
+ assert.equal(contextualStudentId('stats',context,[]),'');
+});
+test('课表视图只持久保存合法视图，空值、未知值和不可用存储默认有课日',()=>{
+ const saved=new Map();
+ const storage={getItem:key=>saved.get(key)??null,setItem:(key,value)=>saved.set(key,value)};
+ assert.equal(readPlannerView(storage),'list');
+ for(const view of ['week','month','list']) {
+  savePlannerView(storage,view);
+  assert.equal(readPlannerView(storage),view);
+ }
+ assert.deepEqual([...saved.entries()],[['lesson-manager.planner-view','list']]);
+ savePlannerView(storage,'invalid');
+ assert.equal(readPlannerView(storage),'list');
+ saved.set('lesson-manager.planner-view','{"student":"s"}');
+ assert.equal(readPlannerView(storage),'list');
+ const unavailable={getItem(){throw Error('unavailable');},setItem(){throw Error('unavailable');}};
+ for(const source of [undefined,null,unavailable]) {
+  assert.equal(readPlannerView(source),'list');
+  assert.doesNotThrow(()=>savePlannerView(source,'month'));
+ }
 });
 test('冲突预览排除自身、取消和相邻课程，并检出重复课程后续冲突',()=>{
  const changes=plannedChanges([],null,{date:'2026-09-07',repeat_until:'2026-09-14',start_time:'18:00',duration_hours:'2',student_id:'s',subject:'数学'});

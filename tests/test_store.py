@@ -182,6 +182,56 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(len(first["created"]), 2)
         self.assertEqual(again, {"created": [], "skipped": 2})
 
+    def test_copy_preview_filters_without_writes_and_keeps_conflicting_candidates(self):
+        other = self.call("POST", "/api/students", {"name": "另一个学生"})
+        self.course()
+        self.course()  # Duplicate source rows must also collapse within a preview.
+        done = self.course(subject="物理", date="2026-09-08")
+        self.call("PATCH", f"/api/courses/{done}", {"status": "completed"})
+        cancelled = self.course(date="2026-09-09")
+        self.call("PATCH", f"/api/courses/{cancelled}", {"status": "cancelled"})
+        self.course(student_id=other["id"], start_time="19:00")
+        self.course(student_id=other["id"], date="2026-09-14", start_time="18:30")
+        before = self.store.state()
+        request = {"week_start": "2026-09-14", "student_id": self.student["id"], "status": "scheduled", "preview": True}
+        preview = self.call("POST", "/api/courses/copy-week", request)
+        self.assertEqual(self.store.state(), before)
+        self.assertEqual(self.call("POST", "/api/courses/copy-week", request), preview)
+        self.assertEqual(preview["skipped"], 1)
+        self.assertEqual(len(preview["created"]), 1)
+        candidate = preview["created"][0]
+        self.assertEqual((candidate["student_id"], candidate["date"], candidate["start_time"]), (self.student["id"], "2026-09-14", "18:00"))
+        committed = self.call("POST", "/api/courses/copy-week", dict(request, preview=False))
+        after = next(c for c in self.store.state()["courses"] if c["id"] == committed["created"][0])
+        self.assertTrue(after["conflict"])
+        self.assertEqual({k: v for k, v in after.items() if k in candidate and k != "id"}, {k: v for k, v in candidate.items() if k != "id"})
+        all_preview = self.call("POST", "/api/courses/copy-week", dict(request, student_id="", status=""))
+        self.assertEqual(len(all_preview["created"]), 2)
+        self.assertEqual(all_preview["skipped"], 2)
+        completed = self.call("POST", "/api/courses/copy-week", dict(request, status="completed"))["created"]
+        self.assertEqual(len(completed), 1)
+        self.assertEqual(completed[0]["status"], "scheduled")
+        self.assertIsNone(completed[0]["hourly_rate_cents"])
+        self.assertIsNone(completed[0]["actual_minutes"])
+        with self.assertRaises(AppError):
+            self.call("POST", "/api/courses/copy-week", dict(request, student_id="missing"))
+        self.assertEqual(self.call("POST", "/api/courses/copy-week", dict(request, status="cancelled")), {"created": [], "skipped": 0})
+
+    def test_following_full_form_preserves_unchanged_fields_and_later_exceptions(self):
+        ids = self.call("POST", "/api/courses", {"student_id": self.student["id"], "subject": "数学", "date": "2026-09-07", "start_time": "18:00", "duration_minutes": 120, "notes": "默认约定", "repeat_until": "2026-09-28"})["created"]
+        self.call("PATCH", f"/api/courses/{ids[2]}", {"date": "2026-09-22", "start_time": "19:00", "duration_minutes": 60, "notes": "单独约定"})
+        self.call("PATCH", f"/api/courses/{ids[3]}", {"status": "cancelled"})
+        original = next(c for c in self.store.state()["courses"] if c["id"] == ids[1])
+        self.call("PATCH", f"/api/courses/{ids[1]}", dict(original, date="2026-09-15", scope="following"))
+        rows = {c["id"]: c for c in self.store.state()["courses"]}
+        self.assertEqual(rows[ids[0]]["date"], "2026-09-07")
+        self.assertEqual(rows[ids[3]]["date"], "2026-09-28")
+        exception = rows[ids[2]]
+        self.assertEqual((exception["date"], exception["start_time"], exception["duration_minutes"], exception["notes"]), ("2026-09-23", "19:00", 60, "单独约定"))
+        self.call("PATCH", f"/api/courses/{ids[1]}", dict(rows[ids[1]], start_time="20:00", scope="following"))
+        exception = next(c for c in self.store.state()["courses"] if c["id"] == ids[2])
+        self.assertEqual((exception["start_time"], exception["duration_minutes"], exception["notes"]), ("20:00", 60, "单独约定"))
+
     def test_conflicts_do_not_include_adjacent_or_cancelled(self):
         a = self.course()
         b = self.course(start_time="20:00")
@@ -380,6 +430,42 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(self.store.state()["courses"][0]["id"], cid)
         with self.assertRaises(AppError):
             self.call("PATCH", f"/api/periods/{period['id']}", {"end": "2026-08-01"})
+
+    def test_period_coverage_edit_and_json_roundtrip(self):
+        period = self.call("POST", "/api/periods", {"name": "秋季导入覆盖", "start": "2026-09-07", "end": "2026-10-28", "range_kind": "coverage", "source_start": "2026-09-07", "source_end": "2026-10-28"})
+        updated = self.call("PATCH", f"/api/periods/{period['id']}", {"range_kind": "term", "start": "2026-09-01", "end": "2027-01-31"})
+        self.assertEqual((updated["range_kind"], updated["source_start"], updated["source_end"]), ("term", "2026-09-07", "2026-10-28"))
+        doc = self.store.export()
+        self.assertEqual(doc["schema_version"], 1)
+        self.store.restore(doc)
+        self.assertEqual(self.store.state()["periods"], [updated])
+        for changes in ({"source_start": None}, {"source_end": "2026-08-01"}, {"source_start": "bad"}, {"range_kind": "invalid"}):
+            with self.subTest(changes=changes), self.assertRaises(AppError):
+                self.call("PATCH", f"/api/periods/{period['id']}", changes)
+        self.assertEqual(self.store.state()["periods"], [updated])
+        legacy = copy.deepcopy(doc)
+        for key in ("range_kind", "source_start", "source_end"):
+            legacy["periods"][0].pop(key)
+        self.store.restore(legacy)
+        restored = self.store.state()["periods"][0]
+        self.assertEqual(restored["range_kind"], "term")
+        self.assertIsNone(restored["source_start"])
+        self.assertIsNone(restored["source_end"])
+
+    def test_sqlite_v1_period_migration_is_reentrant_and_preserves_existing_data(self):
+        with tempfile.TemporaryDirectory(prefix="lessonmanager-v1-") as folder:
+            path = Path(folder) / "lessonmanager.sqlite3"
+            with sqlite3.connect(path) as conn:
+                conn.execute("CREATE TABLE periods (id TEXT PRIMARY KEY, name TEXT NOT NULL, start TEXT NOT NULL, end TEXT NOT NULL)")
+                conn.execute("INSERT INTO periods VALUES ('old', '已有用户学期', '2026-09-01', '2027-01-31')")
+                conn.execute("PRAGMA user_version=1")
+            migrated = Store(folder)
+            expected = {"id": "old", "name": "已有用户学期", "start": "2026-09-01", "end": "2027-01-31", "range_kind": "term", "source_start": None, "source_end": None}
+            self.assertEqual(migrated.state()["periods"], [expected])
+            with migrated.connect() as conn:
+                self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 2)
+            migrated.mutate("PATCH", "/api/periods/old", {"range_kind": "coverage"})
+            self.assertEqual(Store(folder).state()["periods"], [dict(expected, range_kind="coverage")])
 
 
 if __name__ == "__main__":

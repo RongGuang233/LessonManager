@@ -18,7 +18,7 @@ from urllib.request import urlopen
 import webbrowser
 from contextlib import closing, contextmanager
 
-VERSION = "1.3.1"
+VERSION = "1.4.0"
 ROOT = Path(__file__).resolve().parent
 DEFAULT_DATA_DIR = Path.home() / "Library" / "Application Support" / "LessonManager"
 TABLES = ("students", "courses", "payments", "reviews", "periods")
@@ -27,7 +27,7 @@ FIELDS = {
     "courses": ("id", "student_id", "subject", "date", "start_time", "duration_minutes", "actual_minutes", "hourly_rate_cents", "status", "notes", "series_id", "source", "needs_review"),
     "payments": ("id", "student_id", "date", "kind", "amount_cents", "notes", "source"),
     "reviews": ("id", "student_id", "course_id", "kind", "message", "source", "status", "resolution"),
-    "periods": ("id", "name", "start", "end"),
+    "periods": ("id", "name", "start", "end", "range_kind", "source_start", "source_end"),
 }
 
 
@@ -168,6 +168,15 @@ def normalize_record(table, raw, historical=False):
         record["end"] = require_date(record["end"])
         if not record["name"] or record["end"] < record["start"]:
             raise AppError("请填写名称，结束日期不能早于开始日期")
+        record["range_kind"] = record["range_kind"] or "term"
+        if record["range_kind"] not in ("term", "coverage"):
+            raise AppError("日期范围类型不正确")
+        record["source_start"] = require_date(record["source_start"], optional=True)
+        record["source_end"] = require_date(record["source_end"], optional=True)
+        if bool(record["source_start"]) != bool(record["source_end"]):
+            raise AppError("导入覆盖开始和结束日期须同时填写")
+        if record["source_start"] and record["source_end"] < record["source_start"]:
+            raise AppError("导入覆盖结束日期不能早于开始日期")
     return record
 
 
@@ -181,7 +190,7 @@ class Store:
         self.lock = threading.RLock()
         with self.connect() as conn:
             version = conn.execute("PRAGMA user_version").fetchone()[0]
-            if version not in (0, 1):
+            if version not in (0, 1, 2):
                 raise AppError("此数据库版本较新，请使用对应版本程序")
             conn.executescript("""
                 CREATE TABLE IF NOT EXISTS students (
@@ -198,12 +207,19 @@ class Store:
                 CREATE TABLE IF NOT EXISTS reviews (
                     id TEXT PRIMARY KEY, student_id TEXT REFERENCES students(id), course_id TEXT REFERENCES courses(id),
                     kind TEXT NOT NULL, message TEXT NOT NULL, source TEXT NOT NULL, status TEXT NOT NULL, resolution TEXT NOT NULL);
-                CREATE TABLE IF NOT EXISTS periods (id TEXT PRIMARY KEY, name TEXT NOT NULL, start TEXT NOT NULL, end TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS periods (id TEXT PRIMARY KEY, name TEXT NOT NULL, start TEXT NOT NULL, end TEXT NOT NULL,
+                    range_kind TEXT NOT NULL DEFAULT 'term', source_start TEXT, source_end TEXT);
                 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
                 CREATE INDEX IF NOT EXISTS courses_student_date ON courses(student_id,date);
                 CREATE INDEX IF NOT EXISTS courses_series ON courses(series_id,date);
-                PRAGMA user_version=1;
             """)
+            if version < 2:
+                conn.execute("BEGIN IMMEDIATE")
+                columns = {row["name"] for row in conn.execute("PRAGMA table_info(periods)")}
+                for name, definition in (("range_kind", "TEXT NOT NULL DEFAULT 'term'"), ("source_start", "TEXT"), ("source_end", "TEXT")):
+                    if name not in columns:
+                        conn.execute(f"ALTER TABLE periods ADD COLUMN {name} {definition}")
+                conn.execute("PRAGMA user_version=2")
         self.backup_database(daily=True)
 
     @contextmanager
@@ -400,20 +416,42 @@ class Store:
                 target = dt.date.fromisoformat(require_date(body.get("week_start")))
                 target -= dt.timedelta(days=target.weekday())
                 previous = target - dt.timedelta(days=7)
-                rows = [self.decode(r) for r in conn.execute("SELECT * FROM courses WHERE date>=? AND date<? AND status!='cancelled'", (previous.isoformat(), target.isoformat()))]
+                student_id = body.get("student_id")
+                status = body.get("status")
+                if student_id == "":
+                    student_id = None
+                if status == "":
+                    status = None
+                if student_id is not None:
+                    if not isinstance(student_id, str):
+                        raise AppError("请选择学生")
+                    self.find(conn, "students", student_id)
+                if status not in (None, "scheduled", "completed", "cancelled"):
+                    raise AppError("复制来源状态不正确")
+                if "preview" in body and not isinstance(body["preview"], bool):
+                    raise AppError("预览参数必须为布尔值")
+                rows = [self.decode(r) for r in conn.execute("SELECT * FROM courses WHERE date>=? AND date<? AND status!='cancelled' ORDER BY date,start_time,id", (previous.isoformat(), target.isoformat()))]
+                rows = [c for c in rows if (student_id is None or c["student_id"] == student_id) and (status is None or c["status"] == status)]
+                keys = {(r["student_id"], r["subject"], r["date"], r["start_time"]) for r in conn.execute("SELECT student_id,subject,date,start_time FROM courses WHERE date>=? AND date<?", (target.isoformat(), (target + dt.timedelta(days=7)).isoformat()))}
                 created, skipped = [], 0
                 for c in rows:
                     if not c["start_time"] or c["duration_minutes"] % 60:
                         skipped += 1
                         continue
                     date = (dt.date.fromisoformat(c["date"]) + dt.timedelta(days=7)).isoformat()
-                    if conn.execute("SELECT 1 FROM courses WHERE student_id=? AND subject=? AND date=? AND start_time=?", (c["student_id"], c["subject"], date, c["start_time"])).fetchone():
+                    key = (c["student_id"], c["subject"], date, c["start_time"])
+                    if key in keys:
                         skipped += 1
                         continue
-                    c.update(id=new_id(), date=date, status="scheduled", actual_minutes=None, hourly_rate_cents=None, source="", needs_review=False, series_id=None)
+                    candidate_id = f"preview:{c['id']}:{date}" if body.get("preview") else new_id()
+                    c.update(id=candidate_id, date=date, status="scheduled", actual_minutes=None, hourly_rate_cents=None, source="", needs_review=False, series_id=None)
+                    keys.add(key)
+                    created.append(c)
+                if body.get("preview"):
+                    return {"created": created, "skipped": skipped}
+                for c in created:
                     self.write(conn, "courses", c)
-                    created.append(c["id"])
-                return {"created": created, "skipped": skipped}
+                return {"created": [c["id"] for c in created], "skipped": skipped}
             if len(parts) == 4 and table == "students" and parts[3] == "settle-history" and method == "POST":
                 student = self.find(conn, "students", parts[2])
                 settlements = self.settlements(conn)
@@ -554,7 +592,7 @@ class Store:
                     c = self.decode(row)
                     c["date"] = (dt.date.fromisoformat(c["date"]) + dt.timedelta(days=shift)).isoformat()
                     for key in ("start_time", "duration_minutes", "notes"):
-                        if key in body:
+                        if record[key] != old[key]:
                             c[key] = record[key]
                     self.write(conn, table, c, replace=True)
                 return record

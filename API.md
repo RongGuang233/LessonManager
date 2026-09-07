@@ -18,17 +18,17 @@ POST /api/students/:id/reconcile {balance_cents,note} → student。记录当前
 
 POST /api/students/:id/settle-history {balance_cents?:0,course_ids:[],payment_ids:[],note} → settlement。按明确的原表结转或用户确认记录历史结余（正数为预付款、负数为欠费、零为结清）；confirmed_on为核对日期，不是付款日期。只覆盖明确列出的、属于该学生的非未来款项和非待上/非未来课程，未知历史字段保持未知。当前余额=确认结余+范围外款项−范围外课费；更正范围内旧明细不再重复影响当前余额。首次确认后重复调用返回原结果，不吸收后续新记录；后续新余额核对使用reconcile。依据与记录范围保存在meta.account_settlements，随备份保存并验证学生及明细关联。范围内记录保留、可更正，不能删除或转到其他学生。结转不是新增缴费、退款或余额差额调整，不计入现金收支统计。
 POST /api/courses {student_id,subject,date,start_time,duration_minutes:120,notes?,repeat_until?} → {created:[id]}; repeat_until为每周重复截止日期。
-PATCH /api/courses/:id {date?,start_time?,duration_minutes?,actual_minutes?,hourly_rate_cents?,status?,notes?,scope?:"one"|"following",needs_review?} → course。确认已上用status=completed、actual_minutes；首次完成时锁定当时学生科目单价；可显式传hourly_rate_cents登记本次试听/特殊价，不修改学生标准价。撤销确认用status=scheduled，余额自动恢复。scope=following仅对同系列后续scheduled课的排期变化生效。
+PATCH /api/courses/:id {date?,start_time?,duration_minutes?,actual_minutes?,hourly_rate_cents?,status?,notes?,scope?:"one"|"following",needs_review?} → course。确认已上用status=completed、actual_minutes；首次完成时锁定当时学生科目单价；可显式传hourly_rate_cents登记本次试听/特殊价，不修改学生标准价。撤销确认用status=scheduled，余额自动恢复。scope=following仅对同系列后续scheduled课的排期变化生效：日期按本次调整的天数平移；开始时间、预计时长、备注仅传播相对原课程实际改变的字段，完整表单内未变字段不会覆盖后续课程的单独约定。
 
 历史课程还可更正 subject。needs_review=false 表示确认本次课程字段，仅解决对应事项：missing_course_fields/legacy_incomplete 须补齐日期、开始时间、科目（不能为“待确认”），已上课程还须实际时长和历史单价；zero_rate 须明确单价（允许确认免费为0）；time_typo/merged_lesson 须明确实际时长。schedule_only、attendance_conflict 和其他类别仍需单独填写核对结果。任何客观字段缺失或关联 pending 事项仍存在时，返回的 needs_review 保持 true。仅补时长、单价不会关闭缺日期事项；未完成核对的已上课程 fee_cents 仍为 null，普通余额差额核对仍受阻；若有独立的已知结余依据，可以通过settle-history保留未知明细并确认历史余额。未知数值不代表已确定课费。
 
 DELETE /api/courses/:id → {ok:true}；仅scheduled可删；历史记录用取消或更正。
-POST /api/courses/copy-week {week_start:"YYYY-MM-DD"} → {created:[id],skipped:number}; 复制上周非cancelled课程至目标周，同学生科目时间相同的不重复创建。
+POST /api/courses/copy-week {week_start:"YYYY-MM-DD",student_id?:id|null,status?:"scheduled"|"completed"|"cancelled"|null,preview?:boolean} → {created:[id],skipped:number}; 复制上周非cancelled课程至目标周，同学生科目日期时间相同（含本次候选之间）的不重复创建。student_id省略/null/空字符串表示全部学生；status省略/null/空字符串表示全部非取消课程，cancelled筛选返回空候选。preview=true返回{created:[course],skipped:number}且不写库；候选course包含拟复制日期、时间、时长及稳定的临时id，可结合当前课程显示冲突。提交时重新使用相同筛选、去重规则，返回实际创建id。skipped只计筛选范围内因重复、缺时间或非整小时不能复制的记录。
 POST /api/payments {student_id,date,kind,amount_cents,notes?} → payment。UI输入退款正数，后端统一取负。
 PATCH /api/payments/:id {date?,kind?,amount_cents?,notes?,review_ids?:[id]} → payment。历史 date=null 在仅改备注时保留；不填 review_ids 时不自动解决核对事项。补填实际发生日期并传入 review_ids 可在同次保存中解决选定的 payment_date_missing；要求每项与此款项有相同 student_id、相同非空 source，且该来源仅对应一笔款项，无 course_id。关联不明或未补日期返回中文错误，整次保存不生效。不可仅按同学生或同类别批量关闭疑点。
 DELETE /api/payments/:id → {ok:true}；需UI确认。
-POST /api/periods {name,start,end} → period
-PATCH /api/periods/:id {name?,start?,end?} → period。编辑学期范围，不改变课程或账目。
+POST /api/periods {name,start,end,range_kind?:"term"|"coverage",source_start?:date|null,source_end?:date|null} → period
+PATCH /api/periods/:id {name?,start?,end?,range_kind?,source_start?,source_end?} → period。term表示用户定义的真实学期，coverage表示目前已录入日期范围、不能当作真实学期起止；省略range_kind默认term。source_start/source_end保留原始导入覆盖日期，须同时为空或成对提供合法范围。修改学期起止而不传source字段时保留原始覆盖范围；不改变课程或账目。数据库从v1短事务升级至v2，已有范围默认term；JSON备份仍为schema_version:1，旧备份可省略三个新增字段。
 DELETE /api/periods/:id → {ok:true}
 PATCH /api/reviews/:id {status,resolution} → review。resolved 必须填写结果；未纳入历史结余的已上课程仍缺日期、开始时间、科目、实际时长或历史单价时拒绝，并指出缺失字段。原表未上课程、已纳入历史结余的课程可以记录依据后归档缺项，保留未知字段；未知费用仍为null，不作免费处理。payment_date_missing 必须能按学生与非空来源唯一对应已有款项，且款项日期已填。最后一个课程事项解决且客观字段齐全后，自动清除课程 needs_review；重新设为 pending 时恢复课程提醒。上述规则均使用现有字段，不增加持久状态或改变备份版本。
 GET /api/backup → 完整JSON备份下载
