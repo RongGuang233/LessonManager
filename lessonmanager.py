@@ -18,7 +18,7 @@ from urllib.request import urlopen
 import webbrowser
 from contextlib import closing, contextmanager
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 ROOT = Path(__file__).resolve().parent
 DEFAULT_DATA_DIR = Path.home() / "Library" / "Application Support" / "LessonManager"
 TABLES = ("students", "courses", "payments", "reviews", "periods")
@@ -87,6 +87,14 @@ def missing_course_fields(course):
             if course[field] is None:
                 missing.append(label)
     return missing
+
+
+def account_balance(courses, payments, settlement=None):
+    closed_courses = set(settlement["course_ids"]) if settlement else set()
+    closed_payments = set(settlement["payment_ids"]) if settlement else set()
+    return (settlement["balance_cents"] if settlement else 0) + sum(
+        p["amount_cents"] for p in payments if p["id"] not in closed_payments
+    ) - sum(fee(c) or 0 for c in courses if c["id"] not in closed_courses)
 
 
 def normalize_record(table, raw, historical=False):
@@ -252,6 +260,11 @@ class Store:
     def set_meta(conn, key, value):
         conn.execute("INSERT INTO meta(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, json.dumps(value, ensure_ascii=False)))
 
+    @staticmethod
+    def settlements(conn):
+        row = conn.execute("SELECT value FROM meta WHERE key='account_settlements'").fetchone()
+        return json.loads(row[0]) if row else {}
+
     def state(self):
         with self.connect() as conn:
             conn.execute("BEGIN")
@@ -279,7 +292,8 @@ class Store:
             payments = [p for p in data["payments"] if p["student_id"] == student["id"]]
             student["paid_cents"] = sum(p["amount_cents"] for p in payments)
             student["charged_cents"] = sum(c["fee_cents"] or 0 for c in courses)
-            student["balance_cents"] = student["paid_cents"] - student["charged_cents"]
+            student["settlement"] = data["meta"].get("account_settlements", {}).get(student["id"])
+            student["balance_cents"] = account_balance(courses, payments, student["settlement"])
             student["completed_minutes"] = sum(c["actual_minutes"] or 0 for c in courses if c["status"] == "completed")
             student["pending_count"] = sum(r["status"] == "pending" and r["student_id"] == student["id"] for r in data["reviews"])
         return data
@@ -330,6 +344,23 @@ class Store:
         clean["meta"] = doc.get("meta", {})
         if not isinstance(clean["meta"], dict):
             raise AppError("备份设置格式不正确")
+        settlements = clean["meta"].get("account_settlements", {})
+        if not isinstance(settlements, dict):
+            raise AppError("备份中的旧账结清记录格式不正确")
+        for sid, settlement in settlements.items():
+            if sid not in students or not isinstance(settlement, dict):
+                raise AppError("旧账结清记录缺少对应学生")
+            require_date(settlement.get("confirmed_on"))
+            integer(settlement.get("balance_cents"), "已确认余额（分）")
+            if not isinstance(settlement.get("note"), str) or not settlement["note"].strip():
+                raise AppError("历史余额核对必须记录确认依据")
+            for table, key in (("courses", "course_ids"), ("payments", "payment_ids")):
+                ids = settlement.get(key)
+                if not isinstance(ids, list) or any(not isinstance(i, str) for i in ids) or len(set(ids)) != len(ids):
+                    raise AppError("旧账结清的明细编号格式不正确")
+                owned = {r["id"] for r in clean[table] if r["student_id"] == sid}
+                if not set(ids) <= owned:
+                    raise AppError("旧账结清的明细关联不完整")
         return clean
 
     def restore(self, doc, initial=False):
@@ -347,6 +378,8 @@ class Store:
                         self.write(conn, table, record)
                 for key, value in clean["meta"].items():
                     if key not in ("data_dir", "app_version"):
+                        if initial and key == "account_settlements":
+                            value = {**value, **self.settlements(conn)}
                         self.set_meta(conn, key, value)
                 self.set_meta(conn, "last_backup_at", stamp())
         return {"ok": True}
@@ -377,6 +410,31 @@ class Store:
                     self.write(conn, "courses", c)
                     created.append(c["id"])
                 return {"created": created, "skipped": skipped}
+            if len(parts) == 4 and table == "students" and parts[3] == "settle-history" and method == "POST":
+                student = self.find(conn, "students", parts[2])
+                settlements = self.settlements(conn)
+                if student["id"] in settlements:
+                    return settlements[student["id"]]
+                note = str(body.get("note") or "").strip()
+                if not note:
+                    raise AppError("请记录已知历史结余的核对依据")
+                settlement = {"confirmed_on": today(), "balance_cents": integer(body.get("balance_cents", 0), "已确认余额（分）"), "note": note}
+                for scope_table, key in (("courses", "course_ids"), ("payments", "payment_ids")):
+                    ids = body.get(key)
+                    if not isinstance(ids, list) or any(not isinstance(i, str) for i in ids) or len(set(ids)) != len(ids):
+                        raise AppError("请选择本次结清的历史明细")
+                    for record_id in ids:
+                        record = self.find(conn, scope_table, record_id)
+                        if record["student_id"] != student["id"]:
+                            raise AppError("结清明细必须属于该学生")
+                        if record["date"] and record["date"] > today() or scope_table == "courses" and record["status"] == "scheduled":
+                            raise AppError("未来记录和待上课程不能纳入历史结清")
+                    settlement[key] = ids
+                settlements[student["id"]] = settlement
+                self.set_meta(conn, "account_settlements", settlements)
+                student["balance_verified"] = True
+                self.write(conn, "students", student, replace=True)
+                return settlement
             if len(parts) == 4 and table == "students" and parts[3] == "reconcile" and method == "POST":
                 student = self.find(conn, "students", parts[2])
                 target = integer(body.get("balance_cents"), "余额（分）")
@@ -384,9 +442,12 @@ class Store:
                 if not notes:
                     raise AppError("请记录余额核对依据")
                 courses = [self.decode(r) for r in conn.execute("SELECT * FROM courses WHERE student_id=?", (student["id"],))]
-                if any(fee(c) is None for c in courses):
+                settlement = self.settlements(conn).get(student["id"])
+                closed = set(settlement["course_ids"]) if settlement else set()
+                if any(fee(c) is None for c in courses if c["id"] not in closed):
                     raise AppError("请先补齐已上课程的时长、单价并完成课程核对，再确认余额")
-                current = conn.execute("SELECT COALESCE(SUM(amount_cents),0) FROM payments WHERE student_id=?", (student["id"],)).fetchone()[0] - sum(fee(c) for c in courses)
+                payments = [self.decode(r) for r in conn.execute("SELECT * FROM payments WHERE student_id=?", (student["id"],))]
+                current = account_balance(courses, payments, settlement)
                 adjustment = normalize_record("payments", {"student_id": student["id"], "date": today(), "kind": "adjustment", "amount_cents": target - current, "notes": "余额核对：" + notes})
                 self.write(conn, "payments", adjustment)
                 student["balance_verified"] = True
@@ -424,11 +485,15 @@ class Store:
             if len(parts) != 3:
                 raise AppError("接口不存在", 404)
             old = self.find(conn, table, parts[2])
+            settlement = self.settlements(conn).get(old.get("student_id"))
+            settled = settlement and old["id"] in settlement.get("course_ids" if table == "courses" else "payment_ids" if table == "payments" else "", [])
             if method == "DELETE":
                 if table not in ("courses", "payments", "periods"):
                     raise AppError("此记录不能删除")
                 if table == "courses" and (old["status"] != "scheduled" or old["source"]):
                     raise AppError("已上或历史课程请通过更正状态保留记录")
+                if settled:
+                    raise AppError("已结清的历史明细请更正信息，保留原记录")
                 conn.execute(f"DELETE FROM {table} WHERE id=?", (old["id"],))
                 return {"ok": True}
             if method != "PATCH":
@@ -438,6 +503,8 @@ class Store:
                 allowed = {"status", "resolution"}
             raw = dict(old)
             raw.update({k: v for k, v in body.items() if k in allowed})
+            if settled and raw["student_id"] != old["student_id"]:
+                raise AppError("已结清的历史明细不能改到其他学生账户")
             if table == "courses":
                 self.find(conn, "students", raw["student_id"])
                 if raw["status"] == "completed" and not old["source"]:

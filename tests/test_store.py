@@ -28,6 +28,93 @@ class StoreTests(unittest.TestCase):
     def balance(self):
         return next(s for s in self.store.state()["students"] if s["id"] == self.student["id"])["balance_cents"]
 
+    def test_settled_history_preserves_unknowns_and_only_new_work_changes_balance(self):
+        doc = self.store.export()
+        sid = self.student["id"]
+        doc["students"][0]["balance_verified"] = False
+        doc["courses"] = [dict(id="old", student_id=sid, subject="数学", date=None, start_time=None,
+                               duration_minutes=120, actual_minutes=None, hourly_rate_cents=None,
+                               status="completed", source="虚构旧表.xlsx / A1", needs_review=True)]
+        doc["payments"] = [dict(id="old-pay", student_id=sid, date=None, kind="payment", amount_cents=50000)]
+        doc["reviews"] = [dict(id="old-review", student_id=sid, course_id="old", kind="missing_course_fields")]
+        self.store.restore(doc)
+        future = self.course(date="2099-09-12")
+        before = self.store.export()
+        result = self.call("POST", f"/api/students/{sid}/settle-history", {
+            "course_ids": ["old"], "payment_ids": ["old-pay"], "note": "老师确认此前全部结清，无欠费无剩余预付款"})
+        self.assertEqual(self.balance(), 0)
+        self.assertEqual(result["balance_cents"], 0)
+        after = self.store.export()
+        for table in ("courses", "payments", "reviews"):
+            self.assertEqual(after[table], before[table])
+        self.assertTrue(self.store.state()["students"][0]["balance_verified"])
+        self.call("PATCH", "/api/courses/old", {"date": "2025-08-01", "start_time": "18:00", "actual_minutes": 120, "hourly_rate_cents": 20000, "needs_review": False})
+        self.call("PATCH", "/api/payments/old-pay", {"date": "2025-07-01", "amount_cents": 70000})
+        self.assertEqual(self.balance(), 0)
+        self.call("PATCH", f"/api/courses/{future}", {"status": "completed", "actual_minutes": 60})
+        self.assertEqual(self.balance(), -15000)
+        self.call("POST", "/api/payments", {"student_id": sid, "date": "2099-09-12", "amount_cents": 10000})
+        self.assertEqual(self.balance(), -5000)
+        # Retrying the historical confirmation must never absorb new lessons or payments.
+        again = self.call("POST", f"/api/students/{sid}/settle-history", {"course_ids": [], "payment_ids": [], "note": "重试"})
+        self.assertEqual(again, result)
+        self.assertEqual(self.balance(), -5000)
+        self.call("PATCH", f"/api/courses/{future}", {"status": "scheduled"})
+        self.assertEqual(self.balance(), 10000)
+        saved = self.store.export()
+        self.store.restore(saved)
+        self.assertEqual(self.balance(), 10000)
+        self.assertEqual(self.store.state()["students"][0]["settlement"], result)
+
+    def test_settlement_scope_and_restore_validation(self):
+        sid = self.student["id"]
+        future = self.course(date="2099-09-12")
+        path = f"/api/students/{sid}/settle-history"
+        with self.assertRaises(AppError):
+            self.call("POST", path, {"course_ids": [future], "payment_ids": [], "note": "结清"})
+        other = self.call("POST", "/api/students", {"name": "另一个虚构学生"})
+        payment = self.call("POST", "/api/payments", {"student_id": other["id"], "date": "2025-01-01", "amount_cents": 20000})
+        with self.assertRaises(AppError):
+            self.call("POST", path, {"course_ids": [], "payment_ids": [payment["id"]], "note": "结清"})
+        self.assertNotIn("account_settlements", self.store.export()["meta"])
+        self.call("POST", path, {"course_ids": [], "payment_ids": [], "note": "历史无结余"})
+        doc = self.store.export()
+        doc["meta"]["account_settlements"][sid]["payment_ids"] = [payment["id"]]
+        with self.assertRaises(AppError):
+            self.store.restore(doc)
+        self.assertEqual(self.store.state()["students"][0]["settlement"]["payment_ids"], [])
+
+    def test_reconcile_current_balance_ignores_settled_unknown_history(self):
+        doc = self.store.export()
+        sid = self.student["id"]
+        doc["courses"] = [dict(id="unknown", student_id=sid, subject="数学", date=None, start_time=None,
+                               status="completed", actual_minutes=None, hourly_rate_cents=None, needs_review=True, source="虚构旧表")]
+        self.store.restore(doc)
+        self.call("POST", f"/api/students/{sid}/settle-history", {"course_ids": ["unknown"], "payment_ids": [], "note": "全部旧账结清"})
+        self.call("POST", f"/api/students/{sid}/reconcile", {"balance_cents": 30000, "note": "核对后续新账"})
+        self.assertEqual(self.balance(), 30000)
+        self.assertIsNone(self.store.state()["courses"][0]["fee_cents"])
+
+    def test_confirmed_carryover_preserves_credit_or_debt_without_cash_payment(self):
+        sid = self.student["id"]
+        for opening in (400000, -90000):
+            with self.subTest(opening=opening):
+                doc = self.store.export()
+                doc["courses"] = []
+                doc["payments"] = [dict(id="old-pay", student_id=sid, date=None, amount_cents=20000, kind="payment")]
+                doc["meta"].pop("account_settlements", None)
+                self.store.restore(doc)
+                self.call("POST", f"/api/students/{sid}/settle-history", {"balance_cents": opening, "course_ids": [], "payment_ids": ["old-pay"], "note": "虚构原表的期初结转扣除本期已上课"})
+                self.assertEqual(self.balance(), opening)
+                self.assertEqual(len(self.store.state()["payments"]), 1)
+                new = self.course()
+                self.call("PATCH", f"/api/courses/{new}", {"status": "completed", "actual_minutes": 60})
+                self.assertEqual(self.balance(), opening - 15000)
+                self.call("POST", "/api/payments", {"student_id": sid, "date": "2026-09-08", "amount_cents": 30000})
+                self.assertEqual(self.balance(), opening + 15000)
+                self.store.restore(self.store.export())
+                self.assertEqual(self.balance(), opening + 15000)
+
     def test_charge_payment_negative_balance_and_idempotent_completion(self):
         course = self.course()
         self.call("POST", "/api/payments", {"student_id": self.student["id"], "date": "2026-09-07", "amount_cents": 10000})

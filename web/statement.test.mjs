@@ -93,3 +93,96 @@ test('空区间与参数验证，失效记录日期进入待核对段', () => {
   state.payments=[payment('bad','2026-02-30',10000)];
   assert.equal(buildStatement(state,'s1','2026-09-01','2026-09-30').undated.length,1);
 });
+
+const settledState = () => {
+ const state=base();
+ state.students[0].balance_verified=false;
+ state.students[0].settlement={confirmed_on:'2026-09-08',balance_cents:0,note:'虚构历史结清',course_ids:['old','old-same-day'],payment_ids:['oldpay']};
+ state.courses=[course('old',null,{fee_cents:null,actual_minutes:null,needs_review:true}),course('old-same-day','2026-09-08',{fee_cents:12000}),course('new','2026-09-09',{fee_cents:20000})];
+ state.payments=[payment('oldpay','2026-09-01',10000),payment('newpay','2026-09-10',25000)];
+ return state;
+};
+
+test('结清后新账从零核算，旧未知不阻塞，同日历史金额不再次扣费',()=>{
+ const state=settledState(),before=structuredClone(state);
+ const result=buildStatement(state,'s1','2026-09-08','2026-09-30');
+ assert.equal(result.summary.balanceReliable,true);
+ assert.equal(result.summary.openingCents,0);
+ assert.equal(result.summary.closingCents,5000);
+ assert.equal(result.summary.feeCents,32000);
+ assert.equal(result.summary.paymentCents,25000);
+ assert.equal(result.summary.netReceivedCents,25000);
+ assert.equal(result.summary.adjustmentCents,0);
+ assert.deepEqual(result.entries.map(e=>[e.id,e.balance]),[['old-same-day',null],['settlement:s1',0],['new',-20000],['newpay',5000]]);
+ assert.equal(result.undated[0].settled,true);
+ assert.equal(result.undated[0].amount,null);
+ assert.match(result.text,/历史金额（已纳入历史余额核对，不再影响当前余额）/);
+ assert.match(result.text,/2026-09-08 确认结清/);
+ assert.match(result.html,/不是新增缴费、退款或现金收入/);
+ assert.match(result.html,/已纳入历史余额核对，不再影响当前余额/);
+ const later=buildStatement(state,'s1','2026-09-10','2026-09-30');
+ assert.equal(later.summary.openingCents,-20000);
+ assert.equal(later.summary.closingCents,5000);
+ assert.deepEqual(state,before);
+});
+
+test('结清前及跨结清日范围仍无确定历史期初期末，不回填未知金额',()=>{
+ const state=settledState();
+ for(const end of ['2026-09-07','2026-09-30']) {
+   const result=buildStatement(state,'s1','2026-09-01',end);
+   assert.equal(result.summary.openingCents,null);
+   assert.equal(result.summary.closingCents,null);
+   assert.equal(result.summary.paymentCents,end==='2026-09-07'?10000:35000);
+   assert.ok(result.entries.filter(e=>e.type!=='settlement').every(e=>e.balance===null));
+   assert.match(result.text,/历史账目于 2026-09-08 确认结清/);
+   assert.equal(result.undated[0].amount,null);
+ }
+});
+
+test('结清后新增反向补录、未知日期或金额使期间结余不确定',()=>{
+ for(const row of [payment('backdated','2026-09-07',1000),payment('undated',null,1000),payment('unknown','2026-09-09',null)]) {
+   const state=settledState();state.payments.push(row);
+   const result=buildStatement(state,'s1','2026-09-08','2026-09-30');
+   assert.equal(result.summary.balanceReliable,false);
+   assert.equal(result.summary.closingCents,null);
+   assert.ok(result.entries.filter(e=>e.type!=='settlement').every(e=>e.balance===null));
+   assert.equal(result.entries.find(e=>e.type==='settlement').balance,0);
+ }
+});
+
+test('其他学生结清范围及未知账不影响目标学生',()=>{
+ const state=settledState();
+ state.payments.push(payment('own','2026-09-09',5000,'payment','s2'));
+ const result=buildStatement(state,'s2','2026-09-08','2026-09-30');
+ assert.equal(result.settlement,null);
+ assert.equal(result.summary.closingCents,5000);
+ assert.doesNotMatch(result.text,/虚构历史结清|历史账目于/);
+});
+
+test('正4000和负900历史结余支持新扣费及缴费且不计作现金或调整',()=>{
+ for(const balance of [400000,-90000]) {
+   const state=settledState();state.students[0].settlement.balance_cents=balance;
+   state.students[0].settlement.note='虚构余额依据';
+   const result=buildStatement(state,'s1','2026-09-08','2026-09-30');
+   assert.equal(result.summary.openingCents,balance);
+   assert.equal(result.summary.closingCents,balance+5000);
+   assert.equal(result.summary.recordedOpeningCents,balance);
+   assert.equal(result.summary.recordedClosingCents,balance+5000);
+   assert.deepEqual(result.entries.map(e=>e.balance),[null,balance,balance-20000,balance+5000]);
+   assert.equal(result.entries[1].amount,0);
+   assert.equal(result.entries[1].label,'历史余额结转');
+   assert.equal(result.summary.paymentCents,25000);
+   assert.equal(result.summary.netReceivedCents,25000);
+   assert.equal(result.summary.refundCents,0);
+   assert.equal(result.summary.adjustmentCents,0);
+   assert.doesNotMatch(result.text+result.html,/结清|零结余|结余为零/);
+   assert.match(result.text,/已纳入历史余额核对，不再影响当前余额/);
+   const later=buildStatement(state,'s1','2026-09-10','2026-09-30');
+   assert.equal(later.summary.openingCents,balance-20000);
+   assert.equal(later.summary.closingCents,balance+5000);
+   const historical=buildStatement(state,'s1','2026-09-01','2026-09-30');
+   assert.equal(historical.summary.openingCents,null);
+   assert.equal(historical.summary.closingCents,null);
+   assert.match(historical.text,/不否定已经确认的历史结余/);
+ }
+});

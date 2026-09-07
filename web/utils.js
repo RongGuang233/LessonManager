@@ -16,15 +16,27 @@ export function statsFor(state,start,end,studentId='') {
 }
 
 export function accountEntries(state,studentId) {
+  const settlement=state.students?.find(s=>s.id===studentId)?.settlement ?? state.meta?.account_settlements?.[studentId] ?? null;
+  const settledCourses=new Set(settlement?.course_ids || []);
+  const settledPayments=new Set(settlement?.payment_ids || []);
   const entries=[
-    ...state.payments.filter(p=>p.student_id===studentId).map(p=>({id:p.id,date:p.date,time:'',type:p.kind,amount:p.amount_cents,notes:p.notes,source:p.source,record:p})),
-    ...state.courses.filter(c=>c.student_id===studentId&&c.status==='completed').map(c=>({id:c.id,date:c.date,time:c.start_time||'',type:'course',amount:c.fee_cents==null?null:-c.fee_cents,notes:c.notes,source:c.source,record:c})),
+    ...state.payments.filter(p=>p.student_id===studentId).map(p=>({id:p.id,date:p.date,time:'',type:p.kind,settled:settledPayments.has(p.id),amount:p.amount_cents,notes:p.notes,source:p.source,record:p})),
+    ...state.courses.filter(c=>c.student_id===studentId&&c.status==='completed').map(c=>({id:c.id,date:c.date,time:c.start_time||'',type:'course',settled:settledCourses.has(c.id),amount:c.fee_cents==null?null:-c.fee_cents,notes:c.notes,source:c.source,record:c})),
   ];
-  const uncertain=entries.some(e=>!e.date||e.amount==null);
-  const dated=entries.filter(e=>e.date).sort((a,b)=>a.date.localeCompare(b.date)||(a.type==='course'?1:0)-(b.type==='course'?1:0)||a.time.localeCompare(b.time));
+  const validDate=value=>typeof value==='string'&&/^\d{4}-\d{2}-\d{2}$/.test(value)&&!Number.isNaN(Date.parse(value))&&new Date(`${value}T12:00:00Z`).toISOString().slice(0,10)===value;
+  const uncertain=settlement
+    ? entries.some(e=>!e.settled&&(!validDate(e.date)||e.date<settlement.confirmed_on||!Number.isSafeInteger(e.amount)||e.record.needs_review))
+    : entries.some(e=>!e.date||e.amount==null);
+  if(settlement) entries.push({id:`settlement:${studentId}`,date:settlement.confirmed_on,time:'',type:'settlement',settled:false,amount:0,notes:`历史账目于 ${settlement.confirmed_on} ${settlement.balance_cents===0?'确认结清':'确认历史余额结转'}，确认结余为 ${money(settlement.balance_cents)}；不代表新增缴费、退款或现金收入。${settlement.note ? ` ${settlement.note}` : ''}`,record:{...settlement,id:`settlement:${studentId}`,student_id:studentId}});
+  const order=e=>e.settled?0:e.type==='settlement'?1:e.type==='course'?3:2;
+  const dated=entries.filter(e=>e.date).sort((a,b)=>a.date.localeCompare(b.date)||order(a)-order(b)||a.time.localeCompare(b.time));
   const undated=entries.filter(e=>!e.date);
   let balance=0;
-  for(const e of dated){balance+=e.amount??0;e.balance=uncertain?null:balance;}
+  for(const e of dated){
+    if(e.type==='settlement'){balance=settlement.balance_cents;e.balance=balance;continue;}
+    if(e.settled){e.balance=null;continue;}
+    balance+=e.amount??0;e.balance=uncertain?null:balance;
+  }
   for(const e of undated)e.balance=null;
-  return {dated,undated,uncertain};
+  return {dated,undated,uncertain,settlement};
 }
