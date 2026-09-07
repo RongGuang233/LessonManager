@@ -77,3 +77,26 @@ test('历史收款核对差额计入净收款，正负保留，按学生和日�
  assert.equal(result.received,14000);assert.equal(result.receiptCorrection,6000);assert.equal(result.adjusted,500);
  assert.equal(accountEntries(state,'s').dated.find(e=>e.id==='c2').amount,-1000);
 });
+
+test('全部区间跨学期且包含无日期记录，仍排除未上课程并保留学生筛选',()=>{
+ const state={courses:[
+  {student_id:'s',status:'completed',date:'2024-01-01',actual_minutes:60,fee_cents:0},
+  {student_id:'s',status:'completed',date:'2026-09-01',actual_minutes:120,fee_cents:30000},
+  {student_id:'s',status:'completed',date:null,actual_minutes:60,fee_cents:10000},
+  {student_id:'s',status:'scheduled',date:'2026-09-15',actual_minutes:120,fee_cents:30000},
+  {student_id:'s',status:'cancelled',date:'2026-09-16',actual_minutes:120,fee_cents:30000},
+  {student_id:'other',status:'completed',date:'2025-01-01',actual_minutes:60,fee_cents:50000},
+ ],payments:[
+  {student_id:'s',date:'2024-01-01',kind:'payment',amount_cents:20000},
+  {student_id:'s',date:null,kind:'receipt_correction',amount_cents:10000},
+  {student_id:'s',date:'2026-09-01',kind:'refund',amount_cents:-1000},
+  {student_id:'s',date:null,kind:'adjustment',amount_cents:500},
+ ]};
+ const all=statsFor(state,'','','s');
+ assert.equal(all.courses.length,3);assert.equal(all.minutes,240);assert.equal(all.fee,40000);
+ assert.equal(all.received,29000);assert.equal(all.adjusted,500);
+ assert.equal(all.undatedCourses,1);assert.equal(all.undatedPayments,2);
+ assert.equal(statsFor(state,'2026-09-01','2026-09-30','s').received,-1000);
+ assert.equal(statsFor(state,'','').fee,90000);
+ assert.equal(statsFor({courses:[],payments:[]},'','').received,0);
+});

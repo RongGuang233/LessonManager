@@ -10,8 +10,9 @@ export const timeLabel = mins => `${String(Math.floor(mins/60)).padStart(2,'0')}
 export const statusText = status => ({scheduled:'待上课',completed:'已上课',cancelled:'请假 / 取消',active:'在读',paused:'暂停',archived:'已归档'}[status] || status);
 export const subjectClass = subject => subject === '数学' ? 'math' : subject === '物理' ? 'physics' : 'other';
 export function statsFor(state,start,end,studentId='') {
-  const courses=state.courses.filter(c=>c.status==='completed' && c.date>=start && c.date<=end && (!studentId||c.student_id===studentId));
-  const payments=state.payments.filter(p=>p.date>=start && p.date<=end && (!studentId||p.student_id===studentId));
+  const inRange = row => (!start && !end) || (row.date && (!start || row.date>=start) && (!end || row.date<=end));
+  const courses=state.courses.filter(c=>c.status==='completed' && inRange(c) && (!studentId||c.student_id===studentId));
+  const payments=state.payments.filter(p=>inRange(p) && (!studentId||p.student_id===studentId));
   return {minutes:courses.reduce((sum,c)=>sum+(c.actual_minutes??0),0),fee:courses.reduce((sum,c)=>sum+(c.fee_cents??0),0),received:payments.filter(p=>p.kind!=='adjustment').reduce((sum,p)=>sum+p.amount_cents,0),receiptCorrection:payments.filter(p=>p.kind==='receipt_correction').reduce((sum,p)=>sum+p.amount_cents,0),adjusted:payments.filter(p=>p.kind==='adjustment').reduce((sum,p)=>sum+p.amount_cents,0),undatedCourses:state.courses.filter(c=>c.status==='completed'&&!c.date&&(!studentId||c.student_id===studentId)).length,undatedPayments:state.payments.filter(p=>!p.date&&(!studentId||p.student_id===studentId)).length,unknown:courses.filter(c=>c.actual_minutes==null||c.fee_cents==null||c.needs_review).length,courses,payments};
 }
 
