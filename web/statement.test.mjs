@@ -34,7 +34,8 @@ test('退款和正负余额调整分别统计，取消课程不扣费', () => {
   assert.equal(result.summary.feeCents,15002);
   assert.equal(result.summary.closingCents,31998);
   assert.deepEqual(result.entries.map(e=>e.label),['缴费','退款','余额调整','余额调整','课程扣费']);
-  assert.match(result.text,/不代表实际发生先后/);
+  assert.match(result.text,/本期退款：¥50\.00/);
+  assert.match(result.text,/本期调整：¥20\.00/);
 });
 
 test('未知费用、时长和日期保留，不纳入已知统计或编造可靠结余', () => {
@@ -54,8 +55,9 @@ test('未知费用、时长和日期保留，不纳入已知统计或编造可�
   assert.ok(result.entries.every(e=>e.balance===null));
   assert.equal(result.entries.find(e=>e.id==='unknown').amount,null);
   assert.match(result.entries.find(e=>e.id==='unknown').detail,/待核对 × 待核对/);
-  assert.match(result.text,/未知金额未按零计算/);
-  assert.match(result.text,/未纳入本期课时、缴费、退款、调整和课费统计/);
+  assert.match(result.text,/待核对金额未计入合计/);
+  assert.doesNotMatch(result.text,/本期收款：¥0\.00/);
+  assert.match(result.text,/2 笔日期待核对记录未计入本期合计/);
 });
 
 test('已核实标志也不能覆盖未知日期或未知费用，区间外未知流水有提示', () => {
@@ -64,7 +66,8 @@ test('已核实标志也不能覆盖未知日期或未知费用，区间外未�
     const result=buildStatement(state,'s1','2026-09-01','2026-09-30');
     assert.equal(result.summary.balanceReliable,false);
     assert.equal(result.summary.closingCents,null);
-    assert.match(result.text,/余额待核对/);
+    assert.match(result.text,/期初、期末余额暂无法确定/);
+    assert.equal(result.summary.currentBalanceCents,entry.amount_cents == null ? null : entry.amount_cents);
   }
 });
 
@@ -75,7 +78,7 @@ test('目标学生隔离，HTML转义，无脚本、外部资源或学生私密�
   const result=buildStatement(state,'s1','2026-09-01','2026-09-30');
   assert.equal(result.entries.length,1);
   assert.doesNotMatch(JSON.stringify(result),/另一学生秘密|另一位学生|档案内部备注|777777/);
-  assert.match(result.html,/&lt;script&gt;/);
+  assert.doesNotMatch(result.text+result.html,/alert\("x"\)|&lt;script&gt;/);
   assert.match(result.html,/&lt;img src=x onerror=alert\(1\)&gt;/);
   assert.doesNotMatch(result.html,/<script|<img|<link|<iframe|https?:\/\//i);
   assert.match(result.html,/@page\{size:A4/);
@@ -86,7 +89,7 @@ test('空区间与参数验证，失效记录日期进入待核对段', () => {
   const state=base();
   const result=buildStatement(state,'s1','2026-09-01','2026-09-30');
   assert.equal(result.summary.closingCents,0);
-  assert.match(result.text,/本期无已完成课程或账户流水/);
+  assert.match(result.text,/本期无已完成课程或收付款记录/);
   assert.throws(()=>buildStatement(state,'missing','2026-09-01','2026-09-30'),/选择学生/);
   assert.throws(()=>buildStatement(state,'s1','2026-09-30','2026-09-01'),/有效/);
   assert.throws(()=>buildStatement(state,'s1','2026-02-30','2026-09-01'),/有效/);
@@ -116,10 +119,10 @@ test('结清后新账从零核算，旧未知不阻塞，同日历史金额不�
  assert.deepEqual(result.entries.map(e=>[e.id,e.balance]),[['old-same-day',null],['settlement:s1',0],['new',-20000],['newpay',5000]]);
  assert.equal(result.undated[0].settled,true);
  assert.equal(result.undated[0].amount,null);
- assert.match(result.text,/历史金额（已纳入历史余额核对，不再影响当前余额）/);
- assert.match(result.text,/2026-09-08 确认结清/);
- assert.match(result.html,/不是新增缴费、退款或现金收入/);
- assert.match(result.html,/已纳入历史余额核对，不再影响当前余额/);
+ assert.match(result.text,/已结转/);
+ assert.match(result.text,/2026-09-08 确认结余/);
+ assert.doesNotMatch(result.html,/不是新增缴费|虚构历史结清/);
+ assert.match(result.html,/不重复影响当前余额/);
  const later=buildStatement(state,'s1','2026-09-10','2026-09-30');
  assert.equal(later.summary.openingCents,-20000);
  assert.equal(later.summary.closingCents,5000);
@@ -134,7 +137,7 @@ test('结清前及跨结清日范围仍无确定历史期初期末，不回填�
    assert.equal(result.summary.closingCents,null);
    assert.equal(result.summary.paymentCents,end==='2026-09-07'?10000:35000);
    assert.ok(result.entries.filter(e=>e.type!=='settlement').every(e=>e.balance===null));
-   assert.match(result.text,/历史账目于 2026-09-08 确认结清/);
+   assert.match(result.text,/2026-09-08 确认结余/);
    assert.equal(result.undated[0].amount,null);
  }
 });
@@ -176,13 +179,56 @@ test('正4000和负900历史结余支持新扣费及缴费且不计作现金或�
    assert.equal(result.summary.refundCents,0);
    assert.equal(result.summary.adjustmentCents,0);
    assert.doesNotMatch(result.text+result.html,/结清|零结余|结余为零/);
-   assert.match(result.text,/已纳入历史余额核对，不再影响当前余额/);
+   assert.match(result.text,/不重复影响当前余额/);
    const later=buildStatement(state,'s1','2026-09-10','2026-09-30');
    assert.equal(later.summary.openingCents,balance-20000);
    assert.equal(later.summary.closingCents,balance+5000);
    const historical=buildStatement(state,'s1','2026-09-01','2026-09-30');
    assert.equal(historical.summary.openingCents,null);
    assert.equal(historical.summary.closingCents,null);
-   assert.match(historical.text,/不否定已经确认的历史结余/);
+   assert.match(historical.text,/当前已确认(?:余额|欠费)/);
+   assert.match(historical.text,/期初、期末余额暂无法确定/);
  }
+});
+
+
+test('家长版突出当前余额和本期三项，零退款及调整隐藏，内部备注不输出',()=>{
+ const state=base();
+ state.payments=[{...payment('p','2026-09-02',480000),notes:'老师内部收款备注',source:'原始来源私密'}];
+ state.courses=[course('c','2026-09-03',{notes:'课程内部长备注',source:'原始课程核对依据'})];
+ const result=buildStatement(state,'s1','2026-09-01','2026-09-30');
+ assert.equal(result.summary.currentBalanceCents,464998);
+ assert.match(result.text,/当前已确认余额：¥4,649\.98/);
+ assert.match(result.text,/本期收款：¥4,800\.00/);
+ assert.match(result.text,/本期上课：1 次 · 1\.5 小时/);
+ assert.match(result.text,/本期扣费：¥150\.02/);
+ assert.doesNotMatch(result.text+result.html,/本期退款|本期调整|本笔后结余|统计说明|老师内部收款备注|原始来源私密|课程内部长备注|原始课程核对依据|含推测日期/);
+});
+
+test('meta旧账范围与新收款分别统计，日期早于确认日仍展示已确认当前4800',()=>{
+ const state=base();state.students[0].balance_verified=false;
+ state.meta={account_settlements:{s1:{confirmed_on:'2026-09-08',balance_cents:0,course_ids:['old'],payment_ids:['oldpay'],note:'老师原始核对依据'}}};
+ state.courses=[course('old',null,{fee_cents:null,needs_review:true})];
+ state.payments=[payment('oldpay','2026-08-01',20000),payment('newpay','2026-09-02',480000)];
+ const result=buildStatement(state,'s1','2026-09-01','2026-09-30');
+ assert.equal(result.summary.currentBalanceCents,480000);
+ assert.equal(result.summary.balanceReliable,false);
+ assert.equal(result.summary.openingCents,null);
+ assert.equal(result.summary.closingCents,null);
+ assert.equal(result.summary.paymentCents,480000);
+ assert.equal(result.undated[0].amount,null);
+ assert.match(result.text,/当前已确认余额：¥4,800\.00/);
+ assert.match(result.text,/本期收款：¥4,800\.00/);
+ assert.doesNotMatch(result.text+result.html,/期初结余|期末结余|本笔后结余|老师原始核对依据|含推测日期|日期待核对记录/);
+});
+
+test('新账未知金额不能显示精确当前余额或零退款、零调整',()=>{
+ const state=settledState();
+ state.payments.push(payment('unknown-refund','2026-09-09',null,'refund'),payment('unknown-adjustment','2026-09-09',null,'adjustment'));
+ const result=buildStatement(state,'s1','2026-09-08','2026-09-30');
+ assert.equal(result.summary.currentBalanceCents,null);
+ assert.match(result.text,/当前余额待核对：待核对/);
+ assert.match(result.text,/本期退款：1 笔金额待核对/);
+ assert.match(result.text,/本期调整：1 笔金额待核对/);
+ assert.doesNotMatch(result.text,/本期退款：¥0|本期调整：¥0|当前已确认余额|期初结余|期末结余/);
 });

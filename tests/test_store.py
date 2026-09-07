@@ -324,6 +324,45 @@ class StoreTests(unittest.TestCase):
         self.call("PATCH", "/api/reviews/time_typo", {"status": "pending", "resolution": "需要再次核实"})
         self.assertIsNone(self.store.state()["courses"][0]["fee_cents"])
 
+    def test_one_lesson_special_rate_does_not_change_student_or_next_lesson(self):
+        trial = self.course()
+        self.call("PATCH", f"/api/courses/{trial}", {"status": "completed", "actual_minutes": 60, "hourly_rate_cents": 8000})
+        self.assertEqual(self.balance(), -8000)
+        self.assertEqual(self.store.state()["students"][0]["rates"]["数学"], 15000)
+        normal = self.course(date="2026-09-08")
+        self.call("PATCH", f"/api/courses/{normal}", {"status": "completed", "actual_minutes": 120})
+        self.assertEqual(self.balance(), -38000)
+        self.call("PATCH", f"/api/courses/{trial}", {"status": "scheduled"})
+        self.assertEqual(self.balance(), -30000)
+        self.call("PATCH", f"/api/courses/{trial}", {"status": "completed", "actual_minutes": 60, "hourly_rate_cents": 15000})
+        self.assertEqual(self.balance(), -45000)
+
+    def test_settled_or_unattended_history_can_archive_missing_details_without_free_fee(self):
+        cid = self.historical_course(["missing_course_fields"], date=None)
+        sid = self.student["id"]
+        self.call("POST", f"/api/students/{sid}/settle-history", {"course_ids": [cid], "payment_ids": [], "note": "历史结清"})
+        self.call("PATCH", "/api/reviews/missing_course_fields", {"status": "resolved", "resolution": "原表未留存日期单价，历史已结清，保留未知资料归档"})
+        course = self.store.state()["courses"][0]
+        self.assertFalse(course["needs_review"])
+        self.assertIsNone(course["fee_cents"])
+        self.assertIsNone(course["date"])
+        self.assertEqual(self.balance(), 0)
+        self.call("PATCH", "/api/reviews/missing_course_fields", {"status": "pending", "resolution": "重新核实"})
+        self.assertTrue(self.store.state()["courses"][0]["needs_review"])
+        self.call("PATCH", f"/api/courses/{cid}", {"status": "cancelled"})
+        self.call("PATCH", "/api/reviews/missing_course_fields", {"status": "resolved", "resolution": "核对为无色未上，不补造缺失字段"})
+        self.assertEqual(self.store.state()["courses"][0]["fee_cents"], 0)
+        self.assertFalse(self.store.state()["courses"][0]["needs_review"])
+
+    def test_edit_period_keeps_existing_lessons_and_invalid_range_rejected(self):
+        cid = self.course()
+        period = self.call("POST", "/api/periods", {"name": "秋季", "start": "2026-09-01", "end": "2026-12-31"})
+        self.call("PATCH", f"/api/periods/{period['id']}", {"name": "秋季学期", "end": "2027-01-31"})
+        self.assertEqual(self.store.state()["periods"][0]["end"], "2027-01-31")
+        self.assertEqual(self.store.state()["courses"][0]["id"], cid)
+        with self.assertRaises(AppError):
+            self.call("PATCH", f"/api/periods/{period['id']}", {"end": "2026-08-01"})
+
 
 if __name__ == "__main__":
     unittest.main()

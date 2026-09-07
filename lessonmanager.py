@@ -18,7 +18,7 @@ from urllib.request import urlopen
 import webbrowser
 from contextlib import closing, contextmanager
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 ROOT = Path(__file__).resolve().parent
 DEFAULT_DATA_DIR = Path.home() / "Library" / "Application Support" / "LessonManager"
 TABLES = ("students", "courses", "payments", "reviews", "periods")
@@ -264,6 +264,10 @@ class Store:
     def settlements(conn):
         row = conn.execute("SELECT value FROM meta WHERE key='account_settlements'").fetchone()
         return json.loads(row[0]) if row else {}
+
+    def historical_details_optional(self, conn, course):
+        settlement = self.settlements(conn).get(course['student_id'], {})
+        return bool(course['source'] and (course['status'] == 'cancelled' or course['id'] in settlement.get('course_ids', [])))
 
     def state(self):
         with self.connect() as conn:
@@ -515,7 +519,7 @@ class Store:
                         raw["hourly_rate_cents"] = student["rates"].get(raw["subject"])
                     if raw["hourly_rate_cents"] is None:
                         raise AppError("请先设置该科小时单价")
-                elif raw["status"] == "completed" and not raw["needs_review"]:
+                elif raw["status"] == "completed" and not raw["needs_review"] and not self.historical_details_optional(conn, raw):
                     if raw["actual_minutes"] is None or raw["hourly_rate_cents"] is None:
                         raise AppError("请明确填写历史课程的实际时长和当时单价后完成核对")
             if table == "reviews" and raw["status"] == "resolved" and not str(raw["resolution"] or "").strip():
@@ -526,7 +530,7 @@ class Store:
                 if record["course_id"]:
                     course = self.find(conn, "courses", record["course_id"])
                     missing = missing_course_fields(course)
-                    if missing:
+                    if missing and not self.historical_details_optional(conn, course):
                         raise AppError("关联课程仍缺少" + "、".join(missing) + "，请先在课程编辑中补齐，再完成核对")
                 if record["kind"] == "payment_date_missing" and not self.payment_for_review(conn, record)["date"]:
                     raise AppError("关联缴费或退款仍缺少日期，请先补填实际发生日期")
@@ -566,14 +570,14 @@ class Store:
                         if resolved:
                             conn.execute("UPDATE reviews SET status='resolved',resolution='已在课程编辑中核对对应字段' WHERE id=?", (review["id"],))
                     pending = conn.execute("SELECT 1 FROM reviews WHERE course_id=? AND status='pending'", (record["id"],)).fetchone()
-                    record["needs_review"] = bool(missing or pending)
+                    record["needs_review"] = bool(pending or (missing and not self.historical_details_optional(conn, record)))
             self.write(conn, table, record, replace=True)
             if table == "courses":
                 record["fee_cents"] = fee(record)
             elif table == "reviews" and record["course_id"]:
                 course = self.find(conn, "courses", record["course_id"])
                 pending = conn.execute("SELECT 1 FROM reviews WHERE course_id=? AND status='pending'", (course["id"],)).fetchone()
-                course["needs_review"] = bool(pending or missing_course_fields(course))
+                course["needs_review"] = bool(pending or (missing_course_fields(course) and not self.historical_details_optional(conn, course)))
                 self.write(conn, "courses", course, replace=True)
             return record
 

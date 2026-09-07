@@ -51,3 +51,33 @@ export function reviewCategory(review) {
   if (/time|时长|时间|课时/.test(text)) return '课时';
   return '其他';
 }
+
+export function lessonCredit(student, courses, date = today()) {
+  if (!student.balance_verified || student.balance_cents < 0) return null;
+  const next = courses.filter(c => c.student_id === student.id && c.status === 'scheduled' && c.date >= date)
+    .sort((a,b) => a.date.localeCompare(b.date) || (a.start_time || '').localeCompare(b.start_time || ''))[0];
+  const rates = Object.entries(student.rates || {}).filter(([,rate]) => rate != null);
+  const subject = next?.subject || (rates.length === 1 ? rates[0][0] : null);
+  const rate = student.rates?.[subject], duration = next?.duration_minutes || 120;
+  if (rate == null || rate <= 0) return null;
+  return {count:Math.floor(student.balance_cents / (rate * duration / 60) * 100) / 100, subject, duration};
+}
+
+export function impactsCurrentAccount(review, students, courses) {
+  const student = students.find(s => s.id === review.student_id);
+  if (!student || student.status !== 'active') return false;
+  if (!student.balance_verified) return true;
+  const course = courses.find(c => c.id === review.course_id);
+  return Boolean(course && course.status === 'completed' && !student.settlement?.course_ids?.includes(course.id));
+}
+
+export function courseHasEnded(course, date = today(), currentMinutes = new Date().getHours()*60+new Date().getMinutes()) {
+  return Boolean(course.date && (course.date < date || (course.date === date && course.start_time && minutes(course.start_time) + course.duration_minutes <= currentMinutes)));
+}
+
+export function backupSummary(doc) {
+  if (!doc || doc.schema_version !== 1 || !['students','courses','payments','reviews','periods'].every(key => Array.isArray(doc[key]))) {
+    throw new Error('请选择完整的课时簿备份。');
+  }
+  return {date:doc.meta?.last_backup_at, students:doc.students.length, courses:doc.courses.length, payments:doc.payments.length};
+}
