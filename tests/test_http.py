@@ -51,6 +51,28 @@ class HttpTests(unittest.TestCase):
             error = json.load(response)
         self.assertIn("缺少", error["error"])
 
+    def test_historical_review_cannot_hide_missing_date_over_http(self):
+        student = self.request("/api/students", "POST", {"name": "历史核对示例"})
+        backup = self.request("/api/backup")
+        backup["courses"] = [dict(id="historical", student_id=student["id"], date=None, start_time="18:00", subject="英语", duration_minutes=120,
+                                   actual_minutes=None, hourly_rate_cents=None, status="completed", source="示例.xlsx / B2", needs_review=True)]
+        backup["reviews"] = [dict(id="missing", student_id=student["id"], course_id="historical", kind="missing_course_fields", source="示例.xlsx / B2")]
+        self.request("/api/restore", "POST", {"backup": backup})
+        course = self.request("/api/courses/historical", "PATCH", {"actual_minutes": 120, "hourly_rate_cents": 15000, "needs_review": False})
+        self.assertIsNone(course["fee_cents"])
+        self.assertEqual(self.request("/api/state")["reviews"][0]["status"], "pending")
+        with self.assertRaises(HTTPError) as caught:
+            self.request("/api/reviews/missing", "PATCH", {"status": "resolved", "resolution": "已确认时长单价"})
+        self.assertEqual(caught.exception.code, 400)
+        with caught.exception as response:
+            self.assertIn("日期", json.load(response)["error"])
+        with self.assertRaises(HTTPError) as caught:
+            self.request(f"/api/students/{student['id']}/reconcile", "POST", {"balance_cents": 0, "note": "原账核对"})
+        with caught.exception as response:
+            self.assertIn("核对", json.load(response)["error"])
+        self.request("/api/courses/historical", "PATCH", {"date": "2024-08-05", "needs_review": False})
+        self.assertEqual(self.request("/api/state")["reviews"][0]["status"], "resolved")
+
 
 if __name__ == "__main__":
     unittest.main()

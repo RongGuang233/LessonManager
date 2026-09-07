@@ -17,14 +17,17 @@ PATCH /api/students/:id 部分更新。调价不改已完成课程单价。
 POST /api/students/:id/reconcile {balance_cents,note} → student。记录余额差额调整，将balance_verified设为true。
 POST /api/courses {student_id,subject,date,start_time,duration_minutes:120,notes?,repeat_until?} → {created:[id]}; repeat_until为每周重复截止日期。
 PATCH /api/courses/:id {date?,start_time?,duration_minutes?,actual_minutes?,hourly_rate_cents?,status?,notes?,scope?:"one"|"following",needs_review?} → course。确认已上用status=completed、actual_minutes；首次完成时锁定当时学生科目单价。撤销确认用status=scheduled，余额自动恢复。scope=following仅对同系列后续scheduled课的排期变化生效。
+
+历史课程还可更正 subject。needs_review=false 表示确认本次课程字段，仅解决对应事项：missing_course_fields/legacy_incomplete 须补齐日期、开始时间、科目（不能为“待确认”），已上课程还须实际时长和历史单价；zero_rate 须明确单价（允许确认免费为0）；time_typo/merged_lesson 须明确实际时长。schedule_only、attendance_conflict 和其他类别仍需单独填写核对结果。任何客观字段缺失或关联 pending 事项仍存在时，返回的 needs_review 保持 true。仅补时长、单价不会关闭缺日期事项；未完成核对的已上课程 fee_cents 仍为 null，余额确认仍受阻，数值不代表已确定课费。
+
 DELETE /api/courses/:id → {ok:true}；仅scheduled可删；历史记录用取消或更正。
 POST /api/courses/copy-week {week_start:"YYYY-MM-DD"} → {created:[id],skipped:number}; 复制上周非cancelled课程至目标周，同学生科目时间相同的不重复创建。
 POST /api/payments {student_id,date,kind,amount_cents,notes?} → payment。UI输入退款正数，后端统一取负。
-PATCH /api/payments/:id 部分更新 → payment
+PATCH /api/payments/:id {date?,kind?,amount_cents?,notes?,review_ids?:[id]} → payment。历史 date=null 在仅改备注时保留；不填 review_ids 时不自动解决核对事项。补填实际发生日期并传入 review_ids 可在同次保存中解决选定的 payment_date_missing；要求每项与此款项有相同 student_id、相同非空 source，且该来源仅对应一笔款项，无 course_id。关联不明或未补日期返回中文错误，整次保存不生效。不可仅按同学生或同类别批量关闭疑点。
 DELETE /api/payments/:id → {ok:true}；需UI确认。
 POST /api/periods {name,start,end} → period
 DELETE /api/periods/:id → {ok:true}
-PATCH /api/reviews/:id {status,resolution} → review
+PATCH /api/reviews/:id {status,resolution} → review。resolved 必须填写结果；关联课程仍缺日期、开始时间、科目或已上课程实际时长/历史单价时拒绝，并指出缺失字段。payment_date_missing 必须能按学生与非空来源唯一对应已有款项，且款项日期已填。最后一个课程事项解决且客观字段齐全后，自动清除课程 needs_review；重新设为 pending 时恢复课程提醒。上述规则均使用现有字段，不增加持久状态或改变备份版本。
 GET /api/backup → 完整JSON备份下载
 POST /api/restore {backup:<完整备份对象>} → {ok:true}；完整验证后替换，自动保留恢复前备份。
 

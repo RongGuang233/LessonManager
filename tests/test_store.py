@@ -161,6 +161,82 @@ class StoreTests(unittest.TestCase):
         self.call("PATCH", f"/api/courses/{course['id']}", {"notes": "仅补充备注"})
         self.assertIsNone(self.store.state()["courses"][0]["actual_minutes"])
 
+    def historical_course(self, kinds, **fields):
+        course_id = self.course()
+        doc = self.store.export()
+        doc["courses"][0].update(source="示例表.xlsx / B2", status="completed", actual_minutes=None, hourly_rate_cents=None, needs_review=True, **fields)
+        doc["reviews"] = [dict(id=kind, student_id=self.student["id"], course_id=course_id, kind=kind,
+                               message="历史事项待核对", source="示例表.xlsx / B2", status="pending", resolution="") for kind in kinds]
+        self.store.restore(doc)
+        return course_id
+
+    def test_confirming_charge_keeps_missing_date_pending_until_filled(self):
+        course_id = self.historical_course(["missing_course_fields", "zero_rate"], date=None)
+        self.call("PATCH", f"/api/courses/{course_id}", {"actual_minutes": 120, "hourly_rate_cents": 15000, "needs_review": False})
+        state = self.store.state()
+        self.assertIsNone(state["courses"][0]["date"])
+        self.assertIsNone(state["courses"][0]["fee_cents"])
+        self.assertEqual({r["id"]: r["status"] for r in state["reviews"]}, {"missing_course_fields": "pending", "zero_rate": "resolved"})
+        with self.assertRaisesRegex(AppError, "日期"):
+            self.call("PATCH", "/api/reviews/missing_course_fields", {"status": "resolved", "resolution": "核对时长单价"})
+        self.call("PATCH", f"/api/courses/{course_id}", {"date": "2024-08-05", "needs_review": False})
+        state = self.store.state()
+        self.assertTrue(all(r["status"] == "resolved" for r in state["reviews"]))
+        self.assertEqual(state["courses"][0]["fee_cents"], 30000)
+
+    def test_charge_confirmation_keeps_other_reviews_and_manual_resolution_updates_fee(self):
+        course_id = self.historical_course(["schedule_only", "time_typo"])
+        self.call("PATCH", f"/api/courses/{course_id}", {"actual_minutes": 120, "hourly_rate_cents": 15000, "needs_review": False})
+        state = self.store.state()
+        self.assertEqual({r["id"]: r["status"] for r in state["reviews"]}, {"schedule_only": "pending", "time_typo": "resolved"})
+        self.assertTrue(state["courses"][0]["needs_review"])
+        self.call("PATCH", "/api/reviews/schedule_only", {"status": "resolved", "resolution": "已与原账核对出勤和扣费"})
+        self.assertEqual(self.store.state()["courses"][0]["fee_cents"], 30000)
+
+    def test_manual_course_review_rejects_objective_missing_fields(self):
+        for fields, label in [({"start_time": None}, "开始时间"), ({"subject": "待确认"}, "科目"), ({}, "实际时长")]:
+            with self.subTest(label=label):
+                doc = self.store.export()
+                doc["courses"] = []
+                doc["reviews"] = []
+                self.store.restore(doc)
+                self.historical_course(["missing_course_fields"], **fields)
+                with self.assertRaisesRegex(AppError, label):
+                    self.call("PATCH", "/api/reviews/missing_course_fields", {"status": "resolved", "resolution": "核对完成"})
+                self.assertEqual(self.store.state()["reviews"][0]["status"], "pending")
+
+    def test_historical_payment_date_preserved_and_only_selected_source_resolved(self):
+        doc = self.store.export()
+        doc["payments"] = [dict(id=f"payment-{n}", student_id=self.student["id"], date=None, kind="payment", amount_cents=10000, source=f"示例表.xlsx / B{n}") for n in (2, 3)]
+        doc["reviews"] = [dict(id=f"review-{n}", student_id=self.student["id"], kind="payment_date_missing", source=f"示例表.xlsx / B{n}") for n in (2, 3)]
+        self.store.restore(doc)
+        self.call("PATCH", "/api/payments/payment-2", {"notes": "仅补充备注"})
+        self.assertIsNone(self.store.state()["payments"][0]["date"])
+        with self.assertRaises(AppError):
+            self.call("PATCH", "/api/payments/payment-2", {"date": "2024-08-05", "review_ids": ["review-3"]})
+        self.assertIsNone(self.store.state()["payments"][0]["date"])
+        with self.assertRaisesRegex(AppError, "日期"):
+            self.call("PATCH", "/api/reviews/review-2", {"status": "resolved", "resolution": "已核对"})
+        self.call("PATCH", "/api/payments/payment-2", {"date": "2024-08-05", "review_ids": ["review-2"]})
+        self.assertEqual({r["id"]: r["status"] for r in self.store.state()["reviews"]}, {"review-2": "resolved", "review-3": "pending"})
+
+    def test_imported_undated_payment_without_source_can_keep_date_empty(self):
+        doc = self.store.export()
+        doc["payments"] = [dict(id="undated", student_id=self.student["id"], date=None, kind="refund", amount_cents=-10000)]
+        self.store.restore(doc)
+        payment = self.call("PATCH", "/api/payments/undated", {"notes": "仅补充备注"})
+        self.assertIsNone(payment["date"])
+        self.assertEqual(payment["amount_cents"], -10000)
+        with self.assertRaisesRegex(AppError, "日期"):
+            self.call("POST", "/api/payments", {"student_id": self.student["id"], "amount_cents": 10000})
+
+    def test_reopening_course_review_restores_unknown_charge(self):
+        course_id = self.historical_course(["time_typo"])
+        self.call("PATCH", f"/api/courses/{course_id}", {"actual_minutes": 121, "hourly_rate_cents": 15000, "needs_review": False})
+        self.assertEqual(self.store.state()["courses"][0]["fee_cents"], 30250)
+        self.call("PATCH", "/api/reviews/time_typo", {"status": "pending", "resolution": "需要再次核实"})
+        self.assertIsNone(self.store.state()["courses"][0]["fee_cents"])
+
 
 if __name__ == "__main__":
     unittest.main()

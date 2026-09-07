@@ -18,7 +18,7 @@ from urllib.request import urlopen
 import webbrowser
 from contextlib import closing, contextmanager
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 ROOT = Path(__file__).resolve().parent
 DEFAULT_DATA_DIR = Path.home() / "Library" / "Application Support" / "LessonManager"
 TABLES = ("students", "courses", "payments", "reviews", "periods")
@@ -73,6 +73,20 @@ def fee(course):
     if course["hourly_rate_cents"] is None or course["actual_minutes"] is None or course["needs_review"]:
         return None
     return int((Decimal(course["hourly_rate_cents"]) * Decimal(course["actual_minutes"]) / 60).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+
+
+def missing_course_fields(course):
+    missing = []
+    for field, label in (("date", "日期"), ("start_time", "开始时间")):
+        if not course[field]:
+            missing.append(label)
+    if str(course["subject"] or "").strip() in ("", "待确认"):
+        missing.append("科目")
+    if course["status"] == "completed":
+        for field, label in (("actual_minutes", "实际时长"), ("hourly_rate_cents", "历史单价")):
+            if course[field] is None:
+                missing.append(label)
+    return missing
 
 
 def normalize_record(table, raw, historical=False):
@@ -225,6 +239,14 @@ class Store:
         result["meta"] = {r["key"]: json.loads(r["value"]) for r in conn.execute("SELECT * FROM meta")}
         result["schema_version"] = 1
         return result
+
+    def payment_for_review(self, conn, review):
+        if review["course_id"] or not review["source"]:
+            raise AppError("此核对事项缺少明确款项关联，请先核实原始来源")
+        payments = conn.execute("SELECT * FROM payments WHERE student_id=? AND source=?", (review["student_id"], review["source"])).fetchall()
+        if len(payments) != 1:
+            raise AppError("无法唯一确定此事项对应的缴费或退款，请先核实原始来源")
+        return self.decode(payments[0])
 
     @staticmethod
     def set_meta(conn, key, value):
@@ -412,6 +434,8 @@ class Store:
             if method != "PATCH":
                 raise AppError("不支持此操作", 405)
             allowed = set(FIELDS[table]) - {"id", "source", "series_id", "balance_verified"}
+            if table == "reviews":
+                allowed = {"status", "resolution"}
             raw = dict(old)
             raw.update({k: v for k, v in body.items() if k in allowed})
             if table == "courses":
@@ -429,7 +453,27 @@ class Store:
                         raise AppError("请明确填写历史课程的实际时长和当时单价后完成核对")
             if table == "reviews" and raw["status"] == "resolved" and not str(raw["resolution"] or "").strip():
                 raise AppError("请填写核对结果")
-            record = normalize_record(table, raw, historical=bool(old.get("source")))
+            historical = bool(old.get("source")) or (table == "payments" and old["date"] is None)
+            record = normalize_record(table, raw, historical=historical)
+            if table == "reviews" and record["status"] == "resolved":
+                if record["course_id"]:
+                    course = self.find(conn, "courses", record["course_id"])
+                    missing = missing_course_fields(course)
+                    if missing:
+                        raise AppError("关联课程仍缺少" + "、".join(missing) + "，请先在课程编辑中补齐，再完成核对")
+                if record["kind"] == "payment_date_missing" and not self.payment_for_review(conn, record)["date"]:
+                    raise AppError("关联缴费或退款仍缺少日期，请先补填实际发生日期")
+            if table == "payments" and "review_ids" in body:
+                review_ids = body["review_ids"]
+                if not isinstance(review_ids, list) or any(not isinstance(item, str) for item in review_ids):
+                    raise AppError("请选择要完成核对的事项")
+                for review_id in review_ids:
+                    review = self.find(conn, "reviews", review_id)
+                    if review["kind"] != "payment_date_missing" or self.payment_for_review(conn, review)["id"] != record["id"]:
+                        raise AppError("所选核对事项与此缴费或退款的原始来源不一致")
+                    if not record["date"]:
+                        raise AppError("请先补填实际发生日期，再完成缴费日期核对")
+                    conn.execute("UPDATE reviews SET status='resolved',resolution='已在款项编辑中补填实际发生日期' WHERE id=?", (review_id,))
             if table == "courses" and body.get("scope") == "following":
                 if old["status"] != "scheduled" or not old["series_id"] or not old["date"]:
                     raise AppError("只能批量调整固定周课中尚未上课的课程")
@@ -443,11 +487,27 @@ class Store:
                             c[key] = record[key]
                     self.write(conn, table, c, replace=True)
                 return record
+            if table == "courses":
+                if body.get("needs_review") is False:
+                    missing = missing_course_fields(record)
+                    reviews = conn.execute("SELECT * FROM reviews WHERE course_id=? AND status='pending'", (record["id"],)).fetchall()
+                    for review in reviews:
+                        kind = review["kind"]
+                        resolved = (kind in ("missing_course_fields", "legacy_incomplete") and not missing
+                                    or kind == "zero_rate" and record["hourly_rate_cents"] is not None
+                                    or kind in ("time_typo", "merged_lesson") and record["actual_minutes"] is not None)
+                        if resolved:
+                            conn.execute("UPDATE reviews SET status='resolved',resolution='已在课程编辑中核对对应字段' WHERE id=?", (review["id"],))
+                    pending = conn.execute("SELECT 1 FROM reviews WHERE course_id=? AND status='pending'", (record["id"],)).fetchone()
+                    record["needs_review"] = bool(missing or pending)
             self.write(conn, table, record, replace=True)
             if table == "courses":
                 record["fee_cents"] = fee(record)
-                if body.get("needs_review") is False:
-                    conn.execute("UPDATE reviews SET status='resolved',resolution='已在课程编辑中核对时长和单价' WHERE course_id=? AND status='pending'", (record["id"],))
+            elif table == "reviews" and record["course_id"]:
+                course = self.find(conn, "courses", record["course_id"])
+                pending = conn.execute("SELECT 1 FROM reviews WHERE course_id=? AND status='pending'", (course["id"],)).fetchone()
+                course["needs_review"] = bool(pending or missing_course_fields(course))
+                self.write(conn, "courses", course, replace=True)
             return record
 
 
