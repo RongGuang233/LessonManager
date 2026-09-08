@@ -13,12 +13,12 @@ import threading
 import uuid
 from decimal import Decimal, ROUND_HALF_UP
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 from urllib.request import urlopen
 import webbrowser
 from contextlib import closing, contextmanager
 
-VERSION = "1.4.0"
+VERSION = "1.5.0"
 ROOT = Path(__file__).resolve().parent
 DEFAULT_DATA_DIR = Path.home() / "Library" / "Application Support" / "LessonManager"
 TABLES = ("students", "courses", "payments", "reviews", "periods")
@@ -318,7 +318,7 @@ class Store:
             student["pending_count"] = sum(r["status"] == "pending" and r["student_id"] == student["id"] for r in data["reviews"])
         return data
 
-    def backup_database(self, daily=False):
+    def backup_database(self, daily=False, preserve=None):
         with self.lock:
             folder = self.data_dir / "backups"
             folder.mkdir(exist_ok=True)
@@ -330,9 +330,59 @@ class Store:
                 source.backup(dest)
             with self.connect() as conn:
                 self.set_meta(conn, "last_backup_at", stamp())
-            for old in sorted(folder.glob("lessonmanager_*.sqlite3"), key=lambda p: p.stat().st_mtime, reverse=True)[30:]:
+            candidates = sorted(folder.glob("lessonmanager_*.sqlite3"), key=lambda p: p.stat().st_mtime, reverse=True)
+            retained = 29 if preserve in candidates else 30
+            for old in [p for p in candidates if p != preserve][retained:]:
                 old.unlink()
             return target
+
+    def backup_path(self, filename):
+        filename = unquote(filename)
+        if (not filename.startswith("lessonmanager_") or not filename.endswith(".sqlite3")
+                or Path(filename).name != filename or "/" in filename or "\\" in filename or "\x00" in filename):
+            raise AppError("备份文件名不正确")
+        path = self.data_dir / "backups" / filename
+        if path.is_symlink() or not path.is_file():
+            raise AppError("本机备份不存在", 404)
+        return path
+
+    @staticmethod
+    def backup_info(path):
+        info = path.stat()
+        return {"filename": path.name, "created_at": dt.datetime.fromtimestamp(info.st_mtime).isoformat(timespec="seconds"), "size_bytes": info.st_size}
+
+    def list_backups(self):
+        with self.lock:
+            paths = [p for p in (self.data_dir / "backups").glob("lessonmanager_*.sqlite3") if p.is_file() and not p.is_symlink()]
+            paths.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+            return {"backups": [self.backup_info(p) for p in paths]}
+
+    def read_database_backup(self, filename):
+        path = self.backup_path(filename)
+        try:
+            # SQLite backup files are standalone snapshots. Immutable read-only mode
+            # also avoids creating journal/SHM files beside the source snapshot.
+            with closing(sqlite3.connect(path.as_uri() + "?mode=ro&immutable=1", uri=True)) as conn:
+                conn.row_factory = sqlite3.Row
+                version = conn.execute("PRAGMA user_version").fetchone()[0]
+                if version not in (1, 2):
+                    raise AppError("此本机备份的数据库版本不受支持")
+                doc = self.raw(conn)
+            clean = self.validate_backup(doc)
+        except (sqlite3.Error, ValueError, TypeError, KeyError) as exc:
+            raise AppError("本机备份损坏或内容格式不正确，未恢复任何数据") from exc
+        clean["schema_version"] = 1
+        return path, version, clean
+
+    def preview_database_backup(self, filename):
+        with self.lock:
+            path, version, doc = self.read_database_backup(filename)
+            return {**self.backup_info(path), "schema_version": version, "counts": {table: len(doc[table]) for table in TABLES}}
+
+    def restore_database_backup(self, filename):
+        with self.lock:
+            path, _version, doc = self.read_database_backup(filename)
+            return self.restore(doc, preserve_backup=path)
 
     def export(self):
         with self.lock:
@@ -383,10 +433,10 @@ class Store:
                     raise AppError("旧账结清的明细关联不完整")
         return clean
 
-    def restore(self, doc, initial=False):
+    def restore(self, doc, initial=False, preserve_backup=None):
         clean = self.validate_backup(doc)
         with self.lock:
-            self.backup_database()
+            self.backup_database(preserve=preserve_backup)
             with self.connect() as conn:
                 if not initial:
                     for table in ("reviews", "payments", "courses", "students", "periods", "meta"):
@@ -408,10 +458,45 @@ class Store:
         if path == "/api/restore" and method == "POST":
             return self.restore(body.get("backup"))
         parts = path.strip("/").split("/")
+        if len(parts) == 4 and parts[:2] == ["api", "backups"] and parts[3] == "restore" and method == "POST":
+            return self.restore_database_backup(parts[2])
         if len(parts) < 2 or parts[0] != "api" or parts[1] not in TABLES:
             raise AppError("接口不存在", 404)
         table = parts[1]
         with self.lock, self.connect() as conn:
+            if table == "courses" and len(parts) == 4 and parts[3] == "cancel" and method == "POST":
+                selected = self.find(conn, "courses", parts[2])
+                scope = body.get("scope")
+                if scope not in ("one", "range", "following"):
+                    raise AppError("请选择停课范围")
+                if "preview" in body and not isinstance(body["preview"], bool):
+                    raise AppError("预览参数必须为布尔值")
+                if scope == "range":
+                    start, end = require_date(body.get("start")), require_date(body.get("end"))
+                    if end < start:
+                        raise AppError("停课结束日期不能早于开始日期")
+                elif scope == "following":
+                    if not selected["series_id"] or not selected["date"] or not selected["start_time"]:
+                        raise AppError("此课程没有有效的重复系列，请选择单次或日期范围停课")
+                courses = []
+                for course in self.state()["courses"]:
+                    if course["student_id"] != selected["student_id"] or course["status"] != "scheduled":
+                        continue
+                    if scope == "one" and course["id"] != selected["id"]:
+                        continue
+                    if scope == "range" and not (course["date"] and start <= course["date"] <= end):
+                        continue
+                    if scope == "following" and (course["series_id"] != selected["series_id"] or not course["date"]
+                            or (course["date"], course["start_time"] or "") < (selected["date"], selected["start_time"])):
+                        continue
+                    courses.append(course)
+                courses.sort(key=lambda c: (c["date"] or "", c["start_time"] or "", c["id"]))
+                if body.get("preview"):
+                    return {"courses": courses, "count": len(courses)}
+                count = 0
+                for course in courses:
+                    count += conn.execute("UPDATE courses SET status='cancelled' WHERE id=? AND status='scheduled'", (course["id"],)).rowcount
+                return {"count": count}
             if table == "courses" and len(parts) == 3 and parts[2] == "copy-week" and method == "POST":
                 target = dt.date.fromisoformat(require_date(body.get("week_start")))
                 target -= dt.timedelta(days=target.weekday())
@@ -645,6 +730,11 @@ def make_handler(store):
                     return self.send_json(store.state())
                 if path == "/api/backup":
                     return self.send_json(store.export(), download=True)
+                if path == "/api/backups":
+                    return self.send_json(store.list_backups())
+                parts = path.strip("/").split("/")
+                if len(parts) == 4 and parts[:2] == ["api", "backups"] and parts[3] == "preview":
+                    return self.send_json(store.preview_database_backup(parts[2]))
                 if path.startswith("/api/"):
                     raise AppError("接口不存在", 404)
                 file = (ROOT / "web" / (path.lstrip("/") or "index.html")).resolve()

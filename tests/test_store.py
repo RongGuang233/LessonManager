@@ -1,6 +1,7 @@
 import copy
 import json
 import sqlite3
+from contextlib import closing
 from pathlib import Path
 import tempfile
 import unittest
@@ -27,6 +28,110 @@ class StoreTests(unittest.TestCase):
 
     def balance(self):
         return next(s for s in self.store.state()["students"] if s["id"] == self.student["id"])["balance_cents"]
+
+    def test_batch_cancel_range_preserves_historical_details_and_accounts(self):
+        anchor = self.course(date="2026-09-07")
+        historical = self.course(date="2026-09-08")
+        completed = self.course(date="2026-09-09")
+        outside = self.course(date="2026-09-10")
+        other = self.call("POST", "/api/students", {"name": "另一个示例学生"})
+        other_course = self.course(student_id=other["id"], date="2026-09-08")
+        self.call("PATCH", f"/api/courses/{completed}", {"status": "completed", "actual_minutes": 60})
+        with self.store.connect() as conn:
+            conn.execute("UPDATE courses SET source='虚构导入.xlsx / B2',needs_review=1,notes='保留原始信息',hourly_rate_cents=13500 WHERE id=?", (historical,))
+        before = self.store.state()
+        db_before = self.store.path.read_bytes()
+        body = {"scope": "range", "start": "2026-09-07", "end": "2026-09-09"}
+        preview = self.call("POST", f"/api/courses/{anchor}/cancel", dict(body, preview=True))
+        self.assertEqual(preview["count"], 2)
+        self.assertEqual({c["id"] for c in preview["courses"]}, {anchor, historical})
+        self.assertTrue(all("fee_cents" in c and "conflict" in c for c in preview["courses"]))
+        self.assertEqual(self.store.path.read_bytes(), db_before)
+        self.assertEqual(self.call("POST", f"/api/courses/{anchor}/cancel", body), {"count": 2})
+        self.assertEqual(self.call("POST", f"/api/courses/{anchor}/cancel", body), {"count": 0})
+        after = self.store.state()
+        for old in before["courses"]:
+            actual = next(c for c in after["courses"] if c["id"] == old["id"])
+            expected = dict(old, status="cancelled") if old["id"] in (anchor, historical) else old
+            self.assertEqual({k: v for k, v in actual.items() if k != "conflict"}, {k: v for k, v in expected.items() if k != "conflict"})
+        for key in ("payments", "reviews", "students"):
+            self.assertEqual(after[key], before[key])
+        self.assertEqual({c["id"] for c in after["courses"] if c["status"] == "scheduled"}, {outside, other_course})
+
+    def test_batch_cancel_one_following_and_invalid_scope(self):
+        ids = self.call("POST", "/api/courses", {"student_id": self.student["id"], "subject": "数学", "date": "2026-09-07", "start_time": "18:00", "duration_minutes": 120, "repeat_until": "2026-09-28"})["created"]
+        separate = self.course(date="2026-09-21")
+        self.call("PATCH", f"/api/courses/{ids[2]}", {"status": "completed", "actual_minutes": 60})
+        url = f"/api/courses/{ids[1]}/cancel"
+        self.assertEqual({c["id"] for c in self.call("POST", url, {"scope": "following", "preview": True})["courses"]}, {ids[1], ids[3]})
+        self.assertEqual(self.call("POST", url, {"scope": "following"}), {"count": 2})
+        self.assertEqual(self.call("POST", url, {"scope": "following"}), {"count": 0})
+        for body in ({"scope": "following"}, {"scope": "bad"}, {"scope": "one", "preview": "true"}, {"scope": "range"}, {"scope": "range", "start": "2026-09-09", "end": "2026-09-07"}):
+            with self.subTest(body=body), self.assertRaises(AppError):
+                self.call("POST", f"/api/courses/{separate}/cancel", body)
+        self.assertEqual(self.call("POST", f"/api/courses/{separate}/cancel", {"scope": "one"}), {"count": 1})
+        self.assertEqual(self.call("POST", f"/api/courses/{ids[2]}/cancel", {"scope": "one"}), {"count": 0})
+        self.assertEqual(next(c for c in self.store.state()["courses"] if c["id"] == ids[0])["status"], "scheduled")
+
+    def test_local_backup_preview_and_restore_preserve_source_and_before_restore_data(self):
+        self.course()
+        source = self.store.backup_database()
+        before_source = (source.read_bytes(), source.stat().st_mtime_ns)
+        self.call("POST", "/api/students", {"name": "备份之后的示例"})
+        before_live = self.store.path.read_bytes()
+        listing = self.store.list_backups()["backups"]
+        self.assertEqual(listing[0]["filename"], source.name)
+        preview = self.store.preview_database_backup(source.name)
+        self.assertEqual(preview["counts"], {"students": 1, "courses": 1, "payments": 0, "reviews": 0, "periods": 0})
+        self.assertEqual(preview["schema_version"], 2)
+        self.assertEqual(self.store.path.read_bytes(), before_live)
+        self.assertEqual(self.call("POST", f"/api/backups/{source.name}/restore"), {"ok": True})
+        self.assertEqual(len(self.store.state()["students"]), 1)
+        self.assertEqual((source.read_bytes(), source.stat().st_mtime_ns), before_source)
+        latest = self.store.list_backups()["backups"][0]
+        self.assertEqual(self.store.preview_database_backup(latest["filename"])["counts"]["students"], 2)
+        self.assertFalse(list(source.parent.glob("*-shm")))
+        self.assertFalse(list(source.parent.glob("*-wal")))
+
+    def test_local_legacy_sqlite_backup_is_read_without_migration(self):
+        self.call("POST", "/api/periods", {"name": "旧版示例学期", "start": "2026-09-01", "end": "2027-01-31"})
+        source = self.store.backup_database()
+        with closing(sqlite3.connect(source)) as conn, conn:
+            conn.execute("ALTER TABLE periods RENAME TO old_periods")
+            conn.execute("CREATE TABLE periods (id TEXT PRIMARY KEY,name TEXT NOT NULL,start TEXT NOT NULL,end TEXT NOT NULL)")
+            conn.execute("INSERT INTO periods SELECT id,name,start,end FROM old_periods")
+            conn.execute("DROP TABLE old_periods")
+            conn.execute("PRAGMA user_version=1")
+        original = source.read_bytes()
+        self.assertEqual(self.store.preview_database_backup(source.name)["schema_version"], 1)
+        self.store.restore_database_backup(source.name)
+        self.assertEqual(source.read_bytes(), original)
+        period = self.store.state()["periods"][0]
+        self.assertEqual((period["range_kind"], period["source_start"], period["source_end"]), ("term", None, None))
+
+    def test_local_backup_invalid_file_and_paths_leave_live_data_intact(self):
+        folder = Path(self.tmp.name) / "backups"
+        invalid = folder / "lessonmanager_broken.sqlite3"
+        invalid.write_bytes(b"not a sqlite database")
+        (folder / "unrelated.sqlite3").write_bytes(b"unrelated")
+        (folder / "lessonmanager_link.sqlite3").symlink_to(self.store.path)
+        self.assertEqual({r["filename"] for r in self.store.list_backups()["backups"]}, {invalid.name, next(folder.glob("lessonmanager_20*.sqlite3")).name})
+        before = self.store.path.read_bytes()
+        for filename in (invalid.name, "../lessonmanager.sqlite3", "lessonmanager_%2Fbad.sqlite3", "lessonmanager_%00bad.sqlite3", "lessonmanager_link.sqlite3", "lessonmanager_absent.sqlite3"):
+            with self.subTest(filename=filename):
+                for method in (self.store.preview_database_backup, self.store.restore_database_backup):
+                    with self.assertRaises(AppError):
+                        method(filename)
+                self.assertEqual(self.store.path.read_bytes(), before)
+
+    def test_restoring_oldest_backup_retains_selected_source_during_rotation(self):
+        source = self.store.backup_database()
+        original = source.read_bytes()
+        for _ in range(28):
+            self.store.backup_database()
+        self.store.restore_database_backup(source.name)
+        self.assertEqual(source.read_bytes(), original)
+        self.assertEqual(len(self.store.list_backups()["backups"]), 30)
 
     def test_signed_historical_receipt_corrections_restore_and_settle(self):
         sid = self.student["id"]

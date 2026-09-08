@@ -24,6 +24,7 @@ PATCH /api/courses/:id {date?,start_time?,duration_minutes?,actual_minutes?,hour
 
 DELETE /api/courses/:id → {ok:true}；仅scheduled可删；历史记录用取消或更正。
 POST /api/courses/copy-week {week_start:"YYYY-MM-DD",student_id?:id|null,status?:"scheduled"|"completed"|"cancelled"|null,preview?:boolean} → {created:[id],skipped:number}; 复制上周非cancelled课程至目标周，同学生科目日期时间相同（含本次候选之间）的不重复创建。student_id省略/null/空字符串表示全部学生；status省略/null/空字符串表示全部非取消课程，cancelled筛选返回空候选。preview=true返回{created:[course],skipped:number}且不写库；候选course包含拟复制日期、时间、时长及稳定的临时id，可结合当前课程显示冲突。提交时重新使用相同筛选、去重规则，返回实际创建id。skipped只计筛选范围内因重复、缺时间或非整小时不能复制的记录。
+POST /api/courses/:id/cancel {scope:"one"|"range"|"following",start?:"YYYY-MM-DD",end?:"YYYY-MM-DD",preview?:boolean} → {count:number}。仅将待上课status改为cancelled，保留其余字段；已完成、已取消课程不受影响，重复提交无新增影响。one仅选中课程；range须提供start/end，包含同学生日期闭区间内全部待上课（不限科目、系列，包含无series_id的历史导入排课）；following须选中有系列且日期时间完整的课程，仅同学生同系列、本次日期时间及以后的待上课。preview=true返回{courses:[完整course],count:number}且不写入，course包含fee_cents/conflict；提交按最新状态重新确定范围。
 POST /api/payments {student_id,date,kind,amount_cents,notes?} → payment。UI输入退款正数，后端统一取负。
 PATCH /api/payments/:id {date?,kind?,amount_cents?,notes?,review_ids?:[id]} → payment。历史 date=null 在仅改备注时保留；不填 review_ids 时不自动解决核对事项。补填实际发生日期并传入 review_ids 可在同次保存中解决选定的 payment_date_missing；要求每项与此款项有相同 student_id、相同非空 source，且该来源仅对应一笔款项，无 course_id。关联不明或未补日期返回中文错误，整次保存不生效。不可仅按同学生或同类别批量关闭疑点。
 DELETE /api/payments/:id → {ok:true}；需UI确认。
@@ -33,6 +34,9 @@ DELETE /api/periods/:id → {ok:true}
 PATCH /api/reviews/:id {status,resolution} → review。resolved 必须填写结果；未纳入历史结余的已上课程仍缺日期、开始时间、科目、实际时长或历史单价时拒绝，并指出缺失字段。原表未上课程、已纳入历史结余的课程可以记录依据后归档缺项，保留未知字段；未知费用仍为null，不作免费处理。payment_date_missing 必须能按学生与非空来源唯一对应已有款项，且款项日期已填。最后一个课程事项解决且客观字段齐全后，自动清除课程 needs_review；重新设为 pending 时恢复课程提醒。上述规则均使用现有字段，不增加持久状态或改变备份版本。
 GET /api/backup → 完整JSON备份下载
 POST /api/restore {backup:<完整备份对象>} → {ok:true}；完整验证后替换，自动保留恢复前备份。
+GET /api/backups → {backups:[{filename,created_at,size_bytes}]}；仅列本机数据目录backups内lessonmanager_*.sqlite3普通文件，按文件修改时间倒序，created_at为本机时间ISO文本。不含符号链接或无关文件，损坏文件可列出但预览/恢复会拒绝。
+GET /api/backups/:filename/preview → {filename,created_at,size_bytes,schema_version,counts:{students,courses,payments,reviews,periods}}；只读验证SQLite备份，不写账本，不修改或迁移源文件。这里schema_version是SQLite版本1或2，JSON格式继续使用schema_version:1；旧版学期字段按现有默认值规范化。
+POST /api/backups/:filename/restore {} → {ok:true}；只接受上述目录内的单一文件名，完整验证后沿用JSON恢复事务，先保存恢复前备份，再替换本机账本；轮转清理时保留本次选中的源文件。损坏/内容不完整/不支持版本返回400 {error}且不覆盖账本，文件不存在返回404 {error}。不自动选择备份或恢复。
 
 错误响应 {error:"中文原因"}，HTTP 400/404/409等。所有更改返回成功后重新GET state即可。
 

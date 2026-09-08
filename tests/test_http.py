@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 import tempfile
 import threading
 import unittest
@@ -50,6 +51,34 @@ class HttpTests(unittest.TestCase):
         with caught.exception as response:
             error = json.load(response)
         self.assertIn("缺少", error["error"])
+
+    def test_batch_cancel_preview_commit_and_repeat_over_http(self):
+        student = self.request("/api/students", "POST", {"name": "停课示例"})
+        courses = self.request("/api/courses", "POST", {"student_id": student["id"], "subject": "数学", "date": "2026-09-07", "start_time": "18:00", "duration_minutes": 120, "repeat_until": "2026-09-21"})["created"]
+        path = f"/api/courses/{courses[1]}/cancel"
+        preview = self.request(path, "POST", {"scope": "following", "preview": True})
+        self.assertEqual(preview["count"], 2)
+        self.assertTrue(all(c["status"] == "scheduled" for c in self.request("/api/state")["courses"]))
+        self.assertEqual(self.request(path, "POST", {"scope": "following"}), {"count": 2})
+        self.assertEqual(self.request(path, "POST", {"scope": "following"}), {"count": 0})
+
+    def test_local_backup_list_preview_restore_and_corrupt_errors_over_http(self):
+        self.request("/api/students", "POST", {"name": "本机备份示例"})
+        self.request("/api/backup")
+        backup = self.request("/api/backups")["backups"][0]
+        path = f"/api/backups/{backup['filename']}"
+        self.assertEqual(self.request(path + "/preview")["counts"]["students"], 1)
+        self.request("/api/students", "POST", {"name": "恢复前示例"})
+        self.assertEqual(self.request(path + "/restore", "POST", {}), {"ok": True})
+        self.assertEqual(len(self.request("/api/state")["students"]), 1)
+        (Path(self.tmp.name) / "backups" / "lessonmanager_corrupt.sqlite3").write_bytes(b"broken")
+        for suffix, method, data in (("preview", "GET", None), ("restore", "POST", {})):
+            with self.subTest(suffix=suffix), self.assertRaises(HTTPError) as caught:
+                self.request(f"/api/backups/lessonmanager_corrupt.sqlite3/{suffix}", method, data)
+            self.assertEqual(caught.exception.code, 400)
+            with caught.exception as response:
+                self.assertIn("损坏", json.load(response)["error"])
+        self.assertEqual(len(self.request("/api/state")["students"]), 1)
 
     def test_copy_preview_and_period_source_range_over_http(self):
         student = self.request("/api/students", "POST", {"name": "复制示例"})
