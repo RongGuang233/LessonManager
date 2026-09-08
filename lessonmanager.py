@@ -18,7 +18,7 @@ from urllib.request import urlopen
 import webbrowser
 from contextlib import closing, contextmanager
 
-VERSION = "1.8.0"
+VERSION = "1.9.2"
 ROOT = Path(__file__).resolve().parent
 DEFAULT_DATA_DIR = Path.home() / "Library" / "Application Support" / "LessonManager"
 TABLES = ("students", "courses", "payments", "reviews", "periods")

@@ -159,3 +159,32 @@ test('补课关联随课程状态变化，取消的补课保留且不会阻止�
  assert.equal(makeupLinks(original,courses).active,undefined);
  assert.deepEqual(makeupLinks({...c,id:'legacy',notes:'补课：旧备注'},courses),{original:undefined,replacements:[],active:undefined});
 });
+
+test('接下来包含今天及未来，全部待上课范围不再排除历史或未知日期',async()=>{
+ const {recordDateMatches}=await import('./workflows.js');
+ for(const date of ['2026-09-08','2026-09-12','2027-01-01'])assert.equal(recordDateMatches(date,'upcoming','','','2026-09-08'),true);
+ for(const date of ['2026-09-07',null,''])assert.equal(recordDateMatches(date,'upcoming','','','2026-09-08'),false);
+ assert.equal(recordDateMatches(null,'all','',''),true);
+ assert.equal(recordDateMatches('2026-08-01','custom','2026-08-01','2026-08-31'),true);
+ assert.equal(recordDateMatches('2026-08-31','custom','2026-08-01','2026-08-31'),true);
+ assert.equal(recordDateMatches('2026-09-01','custom','2026-08-01','2026-08-31'),false);
+});
+
+test('对账继承明确记录区间，概览或无界与待定范围回到本月',async()=>{
+ const {statementRange}=await import('./workflows.js');
+ const context={tab:'ledger',mode:'custom',start:'2026-08-01',end:'2026-08-31'};
+ for(const tab of ['ledger','courses'])for(const mode of ['custom','recent','period:term']){
+  assert.deepEqual(statementRange({...context,tab,mode},'2026-09-08'),{start:'2026-08-01',end:'2026-08-31'});
+ }
+ for(const change of [{tab:'overview'},{tab:'profile'},{mode:'all'},{mode:'upcoming'},{pending:true},{start:''},{end:'2026-07-01'}]){
+  assert.deepEqual(statementRange({...context,...change},'2026-09-08'),{start:'2026-09-01',end:'2026-09-08'});
+ }
+});
+
+test('归档搜索只在非空查询和其他状态筛选下提示，不把筛选空误作空账本',async()=>{
+ const {studentMatchesSearch,archivedSearchMatches}=await import('./workflows.js');
+ const students=[{id:'active',name:'示例甲',status:'active',grade:'初一'},{id:'old',name:'示例乙',status:'archived',grade:''}];
+ assert.equal(studentMatchesSearch(students[0],' 初一 '),true);
+ assert.deepEqual(archivedSearchMatches(students,' 示例乙 ','active').map(s=>s.id),['old']);
+ for(const [query,status] of [['','active'],['  ','active'],['示例乙',''],['示例乙','archived'],['不存在','active']])assert.deepEqual(archivedSearchMatches(students,query,status),[]);
+});

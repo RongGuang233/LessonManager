@@ -62,6 +62,28 @@ export function makeupLinks(course, courses) {
   return {original, replacements, active:replacements.find(c => c.status !== 'cancelled')};
 }
 
+export function recordDateMatches(date, mode, start, end, now = today()) {
+  if (mode === 'all') return true;
+  if (!date) return false;
+  return mode === 'upcoming' ? date >= now : date >= start && date <= end;
+}
+
+export function statementRange(context, now = today()) {
+  const {tab, mode, start, end, pending = false} = context;
+  const inherited = ['ledger', 'courses'].includes(tab) && !['all', 'upcoming'].includes(mode)
+    && !pending && Boolean(start && end && start <= end);
+  return inherited ? {start, end} : {start:now.slice(0,7)+'-01', end:now};
+}
+
+export function studentMatchesSearch(student, query) {
+  return `${student.name} ${student.grade || ''}`.includes(query.trim());
+}
+
+export function archivedSearchMatches(students, query, status) {
+  return query.trim() && status && status !== 'archived'
+    ? students.filter(s => s.status === 'archived' && studentMatchesSearch(s, query)) : [];
+}
+
 export function plannedChanges(courses, course, form) {
   if (course) {
     const following = form.scope === 'following' && course.series_id && course.status === 'scheduled' && course.date;
