@@ -67,4 +67,21 @@ test('补录以前缴费时仍按当前未来排课折算', () => {
     course({date:'2026-08-02',duration_minutes:60}),course({date:'2026-09-09',duration_minutes:120})]);
   assert.match(text,/缴费日期：2026-08-01/);
   assert.match(text,/每节 2 小时估算，当前余额约可上 3 节/);
+  assert.match(text,/余额截至：2026-09-08/);
+});
+
+test('历史回执标记推测日期，但不泄露完整核对依据或内部备注', () => {
+  const text=buildPaymentReceipt(payment({date:'2026-07-01',notes:'内部备注\n【推测日期】earliest=2026-06-01，源文件核对依据'}),student(),[course()]);
+  assert.match(text,/缴费日期：2026-07-01（推测日期）/);
+  assert.match(text,/余额截至：2026-09-08/);
+  assert.doesNotMatch(text,/内部备注|earliest|源文件核对依据/);
+  assert.match(text,/当前余额：¥600\.00/);
+});
+
+test('日期缺失或无效时即便备注有推测依据也不编造日期', () => {
+  for (const date of [null,'','2026-02-30','not-a-date']) {
+    const text=buildPaymentReceipt(payment({date,notes:'【推测日期】可能在暑假'}),student());
+    assert.match(text,/缴费日期：待核对/);
+    assert.doesNotMatch(text,/可能在暑假|缴费日期：.*推测日期/);
+  }
 });

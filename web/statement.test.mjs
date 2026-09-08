@@ -316,3 +316,35 @@ test('正负核对相抵为零保留逐笔符号，汇总不显示多余零差�
  assert.doesNotMatch(result.text,/历史收款核对：/);
  assert.match(result.text,/核对后净收款：¥0\.00/);
 });
+
+test('本期发生额与出具日当前余额清楚分开，历史区间不冒充当前余额',()=>{
+ const state=base();
+ state.payments=[payment('old','2026-07-01',10000),payment('new','2026-09-08',30000)];
+ const result=buildStatement(state,'s1','2026-07-01','2026-07-31','2026-09-08');
+ assert.equal(result.summary.asOf,'2026-09-08');
+ assert.equal(result.summary.paymentCents,10000);
+ assert.equal(result.summary.closingCents,10000);
+ assert.equal(result.summary.currentBalanceCents,40000);
+ assert.match(result.text,/当前余额：¥400\.00/);
+ assert.match(result.text,/余额截至：2026-09-08/);
+ assert.match(result.text,/本期发生额：2026-07-01 至 2026-07-31/);
+ assert.match(result.html,/截至 2026-09-08/);
+ assert.match(result.html,/本期发生额仅统计以上日期范围/);
+ assert.throws(()=>buildStatement(state,'s1','2026-07-01','2026-07-31','2026-02-30'),/出具日期/);
+});
+
+test('家长对账标记缴费和课程的推测日期，不带出内部依据且不补造未知日期',()=>{
+ const state=base();
+ state.payments=[{...payment('p','2026-09-01',30000),notes:'收款备注\n【推测日期】earliest=2026-08-31，内部推理'},
+  {...payment('unknown',null,2000),notes:'【推测日期】暑期推测'}];
+ state.courses=[course('c','2026-09-02',{notes:'【推测日期】latest=2026-09-03，课程核对'})];
+ const result=buildStatement(state,'s1','2026-09-01','2026-09-30','2026-09-08');
+ assert.equal(result.entries.find(e=>e.id==='p').inferred,true);
+ assert.equal(result.entries.find(e=>e.id==='c').inferred,true);
+ assert.equal(result.undated[0].date,null);
+ assert.match(result.text,/2026-09-01（推测日期）/);
+ assert.match(result.html,/2026-09-02（推测日期）/);
+ assert.match(result.text,/日期待核对 · 缴费/);
+ assert.doesNotMatch(result.text+result.html,/earliest|latest|内部推理|课程核对|暑期推测|收款备注/);
+ assert.match(result.text,/期初、期末余额暂无法确定/);
+});
