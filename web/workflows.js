@@ -82,13 +82,17 @@ export function reviewCategory(review) {
   return '其他';
 }
 
+export function regularDuration(student) {
+  const value=student?.default_duration_minutes;
+  return Number.isInteger(value)&&value>=60&&value<=1440&&value%60===0?value:120;
+}
 export function lessonCredit(student, courses, date = today()) {
   if (!student.balance_verified || student.balance_cents < 0) return null;
   const next = courses.filter(c => c.student_id === student.id && c.status === 'scheduled' && c.date >= date)
     .sort((a,b) => a.date.localeCompare(b.date) || (a.start_time || '').localeCompare(b.start_time || ''))[0];
   const rates = Object.entries(student.rates || {}).filter(([,rate]) => rate != null);
   const subject = next?.subject || (rates.length === 1 ? rates[0][0] : null);
-  const rate = student.rates?.[subject], duration = next?.duration_minutes || 120;
+  const rate = student.rates?.[subject], duration = regularDuration(student);
   if (rate == null || rate <= 0) return null;
   return {count:Math.floor(student.balance_cents / (rate * duration / 60) * 100) / 100, subject, duration};
 }

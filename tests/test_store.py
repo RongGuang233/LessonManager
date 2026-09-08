@@ -29,6 +29,80 @@ class StoreTests(unittest.TestCase):
     def balance(self):
         return next(s for s in self.store.state()["students"] if s["id"] == self.student["id"])["balance_cents"]
 
+    def test_regular_duration_validation_and_existing_charges_stay_unchanged(self):
+        self.assertEqual(self.student["default_duration_minutes"], 120)
+        course = self.course()
+        self.call("PATCH", f"/api/courses/{course}", {"status": "completed", "actual_minutes": 60})
+        before = self.store.state()
+        sid = self.student["id"]
+        for duration in (60, 180, 1440):
+            updated = self.call("PATCH", f"/api/students/{sid}", {"default_duration_minutes": duration})
+            self.assertEqual(updated["default_duration_minutes"], duration)
+            self.assertEqual(self.store.state()["courses"], before["courses"])
+            self.assertEqual(self.balance(), -15000)
+        for duration in (0, -60, 30, 90, 1500, 60.5, True, "120"):
+            with self.subTest(duration=duration), self.assertRaises(AppError):
+                self.call("PATCH", f"/api/students/{sid}", {"default_duration_minutes": duration})
+        doc = self.store.export()
+        self.store.restore(doc)
+        self.assertEqual(self.store.state()["students"][0]["default_duration_minutes"], 1440)
+        del doc["students"][0]["default_duration_minutes"]
+        self.store.restore(doc)
+        self.assertEqual(self.store.state()["students"][0]["default_duration_minutes"], 120)
+        self.assertEqual(self.store.state()["courses"], before["courses"])
+
+    def test_sqlite_v2_duration_migration_and_backup_restore_preserve_accounts(self):
+        self.course()
+        self.call("POST", "/api/payments", {"student_id": self.student["id"], "date": "2026-09-01", "amount_cents": 480000})
+        with self.store.connect() as conn:
+            conn.execute("ALTER TABLE students DROP COLUMN default_duration_minutes")
+            conn.execute("PRAGMA user_version=2")
+            original = self.store.raw(conn)
+        source = self.store.backup_database()
+        source_bytes = source.read_bytes()
+        with self.store.connect() as conn:
+            original = self.store.raw(conn)
+        migrated = Store(self.tmp.name)
+        with migrated.connect() as conn:
+            after = migrated.raw(conn)
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 3)
+        expected = copy.deepcopy(original)
+        for student in expected["students"]:
+            student["default_duration_minutes"] = 120
+        self.assertEqual(after, expected)
+        migrated.mutate("PATCH", f"/api/students/{self.student['id']}", {"default_duration_minutes": 180})
+        self.assertEqual(Store(self.tmp.name).state()["students"][0]["default_duration_minutes"], 180)
+        self.assertEqual(migrated.preview_database_backup(source.name)["schema_version"], 2)
+        migrated.restore_database_backup(source.name)
+        self.assertEqual(source.read_bytes(), source_bytes)
+        self.assertEqual(migrated.state()["students"][0]["default_duration_minutes"], 120)
+        for table in ("courses", "payments", "reviews", "periods"):
+            with migrated.connect() as conn:
+                self.assertEqual(migrated.raw(conn)[table], original[table])
+        self.assertEqual(self.balance(), 480000)
+
+    def test_pending_period_date_transitions_and_backups(self):
+        self.course()
+        courses = self.store.state()["courses"]
+        period = self.call("POST", "/api/periods", {"name": "日期待定学期", "range_kind": "pending"})
+        self.assertEqual((period["start"], period["end"]), ("", ""))
+        path = f"/api/periods/{period['id']}"
+        for body in ({"range_kind": "term"}, {"range_kind": "coverage"}, {"name": ""}):
+            with self.subTest(body=body), self.assertRaises(AppError):
+                self.call("PATCH", path, body)
+        coverage = {"range_kind": "coverage", "start": "2026-09-01", "end": "2026-09-30", "source_start": "2026-09-01", "source_end": "2026-09-30"}
+        self.call("PATCH", path, coverage)
+        pending = self.call("PATCH", path, {"range_kind": "pending"})
+        self.assertEqual((pending["start"], pending["end"], pending["source_start"], pending["source_end"]), ("", "", "2026-09-01", "2026-09-30"))
+        snapshot = self.store.export()
+        source = self.store.backup_database()
+        self.call("PATCH", path, {"range_kind": "term", "start": "2026-09-01", "end": "2027-01-31"})
+        self.store.restore_database_backup(source.name)
+        self.assertEqual(self.store.state()["periods"], [pending])
+        self.store.restore(snapshot)
+        self.assertEqual(self.store.state()["periods"], [pending])
+        self.assertEqual(self.store.state()["courses"], courses)
+
     def test_batch_cancel_range_preserves_historical_details_and_accounts(self):
         anchor = self.course(date="2026-09-07")
         historical = self.course(date="2026-09-08")
@@ -83,7 +157,7 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(listing[0]["filename"], source.name)
         preview = self.store.preview_database_backup(source.name)
         self.assertEqual(preview["counts"], {"students": 1, "courses": 1, "payments": 0, "reviews": 0, "periods": 0})
-        self.assertEqual(preview["schema_version"], 2)
+        self.assertEqual(preview["schema_version"], 3)
         self.assertEqual(self.store.path.read_bytes(), before_live)
         self.assertEqual(self.call("POST", f"/api/backups/{source.name}/restore"), {"ok": True})
         self.assertEqual(len(self.store.state()["students"]), 1)
@@ -101,6 +175,7 @@ class StoreTests(unittest.TestCase):
             conn.execute("CREATE TABLE periods (id TEXT PRIMARY KEY,name TEXT NOT NULL,start TEXT NOT NULL,end TEXT NOT NULL)")
             conn.execute("INSERT INTO periods SELECT id,name,start,end FROM old_periods")
             conn.execute("DROP TABLE old_periods")
+            conn.execute("ALTER TABLE students DROP COLUMN default_duration_minutes")
             conn.execute("PRAGMA user_version=1")
         original = source.read_bytes()
         self.assertEqual(self.store.preview_database_backup(source.name)["schema_version"], 1)
@@ -108,6 +183,7 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(source.read_bytes(), original)
         period = self.store.state()["periods"][0]
         self.assertEqual((period["range_kind"], period["source_start"], period["source_end"]), ("term", None, None))
+        self.assertEqual(self.store.state()["students"][0]["default_duration_minutes"], 120)
 
     def test_local_backup_invalid_file_and_paths_leave_live_data_intact(self):
         folder = Path(self.tmp.name) / "backups"
@@ -568,7 +644,7 @@ class StoreTests(unittest.TestCase):
             expected = {"id": "old", "name": "已有用户学期", "start": "2026-09-01", "end": "2027-01-31", "range_kind": "term", "source_start": None, "source_end": None}
             self.assertEqual(migrated.state()["periods"], [expected])
             with migrated.connect() as conn:
-                self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 2)
+                self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 3)
             migrated.mutate("PATCH", "/api/periods/old", {"range_kind": "coverage"})
             self.assertEqual(Store(folder).state()["periods"], [dict(expected, range_kind="coverage")])
 

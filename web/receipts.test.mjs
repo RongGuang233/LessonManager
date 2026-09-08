@@ -15,7 +15,7 @@ test('回执使用本次金额和保存后余额，按明确科目时长估算�
   assert.match(text,/收到缴费：¥400\.00/);
   assert.match(text,/缴费日期：2026-09-08/);
   assert.match(text,/当前余额：¥600\.00/);
-  assert.match(text,/按数学每节 1\.5 小时估算，当前余额约可上 4 节/);
+  assert.match(text,/按数学每节 2 小时估算，当前余额约可上 3 节/);
   assert.doesNotMatch(text,/内部/);
   assert.deepEqual({p,s,courses},before);
 });

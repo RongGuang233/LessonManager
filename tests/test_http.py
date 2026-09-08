@@ -52,6 +52,23 @@ class HttpTests(unittest.TestCase):
             error = json.load(response)
         self.assertIn("缺少", error["error"])
 
+    def test_regular_duration_and_pending_period_over_http(self):
+        student = self.request("/api/students", "POST", {"name": "常规课长示例", "default_duration_minutes": 180})
+        self.assertEqual(student["default_duration_minutes"], 180)
+        period = self.request("/api/periods", "POST", {"name": "下学期待定", "range_kind": "pending"})
+        self.assertEqual((period["start"], period["end"]), ("", ""))
+        for path, body in ((f"/api/students/{student['id']}", {"default_duration_minutes": 90}), (f"/api/periods/{period['id']}", {"range_kind": "term"})):
+            with self.subTest(path=path), self.assertRaises(HTTPError) as caught:
+                self.request(path, "PATCH", body)
+            self.assertEqual(caught.exception.code, 400)
+            caught.exception.close()
+        backup = self.request("/api/backup")
+        self.request(f"/api/periods/{period['id']}", "PATCH", {"range_kind": "term", "start": "2026-09-01", "end": "2027-01-31"})
+        self.request("/api/restore", "POST", {"backup": backup})
+        state = self.request("/api/state")
+        self.assertEqual(state["periods"], [period])
+        self.assertEqual(state["students"][0]["default_duration_minutes"], 180)
+
     def test_batch_cancel_preview_commit_and_repeat_over_http(self):
         student = self.request("/api/students", "POST", {"name": "停课示例"})
         courses = self.request("/api/courses", "POST", {"student_id": student["id"], "subject": "数学", "date": "2026-09-07", "start_time": "18:00", "duration_minutes": 120, "repeat_until": "2026-09-21"})["created"]

@@ -18,12 +18,12 @@ from urllib.request import urlopen
 import webbrowser
 from contextlib import closing, contextmanager
 
-VERSION = "1.6.0"
+VERSION = "1.7.0"
 ROOT = Path(__file__).resolve().parent
 DEFAULT_DATA_DIR = Path.home() / "Library" / "Application Support" / "LessonManager"
 TABLES = ("students", "courses", "payments", "reviews", "periods")
 FIELDS = {
-    "students": ("id", "name", "status", "grade", "notes", "rates", "balance_verified"),
+    "students": ("id", "name", "status", "grade", "notes", "rates", "balance_verified", "default_duration_minutes"),
     "courses": ("id", "student_id", "subject", "date", "start_time", "duration_minutes", "actual_minutes", "hourly_rate_cents", "status", "notes", "series_id", "source", "needs_review"),
     "payments": ("id", "student_id", "date", "kind", "amount_cents", "notes", "source"),
     "reviews": ("id", "student_id", "course_id", "kind", "message", "source", "status", "resolution"),
@@ -117,6 +117,10 @@ def normalize_record(table, raw, historical=False):
             raise AppError("科目单价格式不正确")
         record["rates"] = {str(k): None if v is None else integer(v, "单价（分）", 0) for k, v in rates.items()}
         record["balance_verified"] = bool(record["balance_verified"])
+        duration = 120 if record["default_duration_minutes"] is None else record["default_duration_minutes"]
+        record["default_duration_minutes"] = integer(duration, "常规课长（分钟）", 60)
+        if record["default_duration_minutes"] % 60 or record["default_duration_minutes"] > 1440:
+            raise AppError("常规课长须为1至24整数小时")
     elif table == "courses":
         record["subject"] = str(record["subject"] or "待确认")
         record["date"] = require_date(record["date"], optional=historical)
@@ -164,13 +168,16 @@ def normalize_record(table, raw, historical=False):
             raise AppError("核对状态不正确")
     else:
         record["name"] = str(record["name"] or "").strip()
-        record["start"] = require_date(record["start"])
-        record["end"] = require_date(record["end"])
+        record["range_kind"] = record["range_kind"] or "term"
+        if record["range_kind"] not in ("term", "coverage", "pending"):
+            raise AppError("日期范围类型不正确")
+        if record["range_kind"] == "pending":
+            record["start"] = record["end"] = ""
+        else:
+            record["start"] = require_date(record["start"])
+            record["end"] = require_date(record["end"])
         if not record["name"] or record["end"] < record["start"]:
             raise AppError("请填写名称，结束日期不能早于开始日期")
-        record["range_kind"] = record["range_kind"] or "term"
-        if record["range_kind"] not in ("term", "coverage"):
-            raise AppError("日期范围类型不正确")
         record["source_start"] = require_date(record["source_start"], optional=True)
         record["source_end"] = require_date(record["source_end"], optional=True)
         if bool(record["source_start"]) != bool(record["source_end"]):
@@ -190,12 +197,13 @@ class Store:
         self.lock = threading.RLock()
         with self.connect() as conn:
             version = conn.execute("PRAGMA user_version").fetchone()[0]
-            if version not in (0, 1, 2):
+            if version not in (0, 1, 2, 3):
                 raise AppError("此数据库版本较新，请使用对应版本程序")
             conn.executescript("""
                 CREATE TABLE IF NOT EXISTS students (
                     id TEXT PRIMARY KEY, name TEXT NOT NULL, status TEXT NOT NULL, grade TEXT NOT NULL,
-                    notes TEXT NOT NULL, rates TEXT NOT NULL, balance_verified INTEGER NOT NULL);
+                    notes TEXT NOT NULL, rates TEXT NOT NULL, balance_verified INTEGER NOT NULL,
+                    default_duration_minutes INTEGER NOT NULL DEFAULT 120);
                 CREATE TABLE IF NOT EXISTS courses (
                     id TEXT PRIMARY KEY, student_id TEXT NOT NULL REFERENCES students(id), subject TEXT NOT NULL,
                     date TEXT, start_time TEXT, duration_minutes INTEGER NOT NULL, actual_minutes INTEGER,
@@ -213,13 +221,17 @@ class Store:
                 CREATE INDEX IF NOT EXISTS courses_student_date ON courses(student_id,date);
                 CREATE INDEX IF NOT EXISTS courses_series ON courses(series_id,date);
             """)
-            if version < 2:
+            if version < 3:
                 conn.execute("BEGIN IMMEDIATE")
-                columns = {row["name"] for row in conn.execute("PRAGMA table_info(periods)")}
-                for name, definition in (("range_kind", "TEXT NOT NULL DEFAULT 'term'"), ("source_start", "TEXT"), ("source_end", "TEXT")):
-                    if name not in columns:
-                        conn.execute(f"ALTER TABLE periods ADD COLUMN {name} {definition}")
-                conn.execute("PRAGMA user_version=2")
+                if version < 2:
+                    columns = {row["name"] for row in conn.execute("PRAGMA table_info(periods)")}
+                    for name, definition in (("range_kind", "TEXT NOT NULL DEFAULT 'term'"), ("source_start", "TEXT"), ("source_end", "TEXT")):
+                        if name not in columns:
+                            conn.execute(f"ALTER TABLE periods ADD COLUMN {name} {definition}")
+                columns = {row["name"] for row in conn.execute("PRAGMA table_info(students)")}
+                if "default_duration_minutes" not in columns:
+                    conn.execute("ALTER TABLE students ADD COLUMN default_duration_minutes INTEGER NOT NULL DEFAULT 120")
+                conn.execute("PRAGMA user_version=3")
         self.backup_database(daily=True)
 
     @contextmanager
@@ -365,7 +377,7 @@ class Store:
             with closing(sqlite3.connect(path.as_uri() + "?mode=ro&immutable=1", uri=True)) as conn:
                 conn.row_factory = sqlite3.Row
                 version = conn.execute("PRAGMA user_version").fetchone()[0]
-                if version not in (1, 2):
+                if version not in (1, 2, 3):
                     raise AppError("此本机备份的数据库版本不受支持")
                 doc = self.raw(conn)
             clean = self.validate_backup(doc)

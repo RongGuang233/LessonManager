@@ -87,7 +87,7 @@ test('冲突预览排除自身、取消和相邻课程，并检出重复课程�
  assert.equal(scheduleConflicts([c],[c]).length,0);
 });
 
-test('余额节数按下一科目和课长折算，免费和多价无排课不乱推算',async()=>{
+test('余额节数按下一科目和常规课长折算，免费和多价无排课不乱推算',async()=>{
  const {lessonCredit}=await import('./workflows.js');
  assert.deepEqual(lessonCredit({...student,balance_cents:480000,rates:{数学:24000}},[{...c,subject:'数学'}],'2026-09-07'),{count:10,subject:'数学',duration:120});
  assert.equal(lessonCredit(student,[],'2026-09-07'),null);
@@ -112,4 +112,17 @@ test('恢复预览读取备份自身时间和数量，拒绝残缺或无关JSON�
  assert.deepEqual(backupSummary(doc),{date:'2026-09-08T10:00:00',students:1,courses:2,payments:1});
  for(const invalid of [null,[],{}, {...doc,courses:undefined},{...doc,schema_version:2}])assert.throws(()=>backupSummary(invalid),/完整的课时簿备份/);
  assert.equal(backupSummary({...doc,students:[],courses:[],payments:[]}).students,0);
+});
+
+
+test('临时一小时不会把十节余额翻倍，常规课长独立且不改变下一次实际课费',async()=>{
+ const {lessonCredit,estimatedFee,regularDuration}=await import('./workflows.js');
+ const s={id:'s',balance_verified:true,balance_cents:480000,rates:{数学:24000},default_duration_minutes:120};
+ const next={student_id:'s',subject:'数学',status:'scheduled',date:'2026-09-12',duration_minutes:60};
+ assert.equal(lessonCredit(s,[next],'2026-09-08').count,10);
+ assert.equal(estimatedFee(next,s),24000);
+ assert.equal(lessonCredit({...s,default_duration_minutes:60},[next],'2026-09-08').count,20);
+ assert.equal(regularDuration({}),120);
+ assert.equal(regularDuration({default_duration_minutes:180}),180);
+ assert.equal(regularDuration({default_duration_minutes:90}),120);
 });
