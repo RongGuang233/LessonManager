@@ -41,6 +41,27 @@ export function savePlannerView(storage, view) {
   try { storage?.setItem(plannerViewKey, view); } catch { /* View preferences are optional. */ }
 }
 
+const studentLocationKey = 'lesson-manager.student-location';
+const studentTabs = ['overview', 'ledger', 'courses', 'profile'];
+export function readStudentLocation(storage) {
+  try {
+    const value = JSON.parse(storage?.getItem(studentLocationKey) || 'null');
+    if (typeof value?.studentId === 'string' && studentTabs.includes(value.tab)) return {studentId:value.studentId, tab:value.tab};
+  } catch { /* A missing preference leaves the normal starting page. */ }
+  return {studentId:'', tab:'overview'};
+}
+export function saveStudentLocation(storage, studentId, tab) {
+  if (!studentId || !studentTabs.includes(tab)) return;
+  try { storage?.setItem(studentLocationKey, JSON.stringify({studentId, tab})); } catch { /* Navigation still works without storage. */ }
+}
+
+export function makeupLinks(course, courses) {
+  const original = courses.find(c => c.id === course.makeup_for_id);
+  const replacements = courses.filter(c => c.makeup_for_id === course.id)
+    .sort((a,b) => (a.date || '').localeCompare(b.date || '') || (a.start_time || '').localeCompare(b.start_time || ''));
+  return {original, replacements, active:replacements.find(c => c.status !== 'cancelled')};
+}
+
 export function plannedChanges(courses, course, form) {
   if (course) {
     const following = form.scope === 'following' && course.series_id && course.status === 'scheduled' && course.date;

@@ -79,6 +79,27 @@ class HttpTests(unittest.TestCase):
         self.assertEqual(self.request(path, "POST", {"scope": "following"}), {"count": 2})
         self.assertEqual(self.request(path, "POST", {"scope": "following"}), {"count": 0})
 
+    def test_makeup_reason_and_selected_copy_over_http(self):
+        student = self.request("/api/students", "POST", {"name": "补课示例", "rates": {"数学": 10000}})
+        body = {"student_id": student["id"], "subject": "数学", "date": "2026-09-07", "start_time": "18:00", "duration_minutes": 120, "notes": "原备注"}
+        source = self.request("/api/courses", "POST", body)["created"][0]
+        self.request(f"/api/courses/{source}/cancel", "POST", {"scope": "one", "reason": "学生请假"})
+        makeup = self.request("/api/courses", "POST", dict(body, date="2026-09-08", makeup_for_id=source))["created"][0]
+        with self.assertRaises(HTTPError) as caught:
+            self.request("/api/courses", "POST", dict(body, makeup_for_id=source))
+        self.assertEqual(caught.exception.code, 400)
+        caught.exception.close()
+        rows = {c["id"]: c for c in self.request("/api/state")["courses"]}
+        self.assertEqual(rows[source]["notes"], "请假原因：学生请假\n原备注")
+        self.assertEqual(rows[makeup]["makeup_for_id"], source)
+        copy_body = {"week_start": "2026-09-14", "source_ids": [makeup], "preview": True}
+        candidate = self.request("/api/courses/copy-week", "POST", copy_body)["created"][0]
+        self.assertEqual(candidate["source_course_id"], makeup)
+        self.assertIsNone(candidate["makeup_for_id"])
+        self.assertEqual(self.request("/api/courses/copy-week", "POST", dict(copy_body, preview=False, source_ids=[])), {"created": [], "skipped": 0})
+        created = self.request("/api/courses/copy-week", "POST", dict(copy_body, preview=False))["created"]
+        self.assertEqual(len(created), 1)
+
     def test_local_backup_list_preview_restore_and_corrupt_errors_over_http(self):
         self.request("/api/students", "POST", {"name": "本机备份示例"})
         self.request("/api/backup")

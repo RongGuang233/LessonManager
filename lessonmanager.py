@@ -18,13 +18,13 @@ from urllib.request import urlopen
 import webbrowser
 from contextlib import closing, contextmanager
 
-VERSION = "1.7.0"
+VERSION = "1.8.0"
 ROOT = Path(__file__).resolve().parent
 DEFAULT_DATA_DIR = Path.home() / "Library" / "Application Support" / "LessonManager"
 TABLES = ("students", "courses", "payments", "reviews", "periods")
 FIELDS = {
     "students": ("id", "name", "status", "grade", "notes", "rates", "balance_verified", "default_duration_minutes"),
-    "courses": ("id", "student_id", "subject", "date", "start_time", "duration_minutes", "actual_minutes", "hourly_rate_cents", "status", "notes", "series_id", "source", "needs_review"),
+    "courses": ("id", "student_id", "subject", "date", "start_time", "duration_minutes", "actual_minutes", "hourly_rate_cents", "status", "notes", "series_id", "source", "needs_review", "makeup_for_id"),
     "payments": ("id", "student_id", "date", "kind", "amount_cents", "notes", "source"),
     "reviews": ("id", "student_id", "course_id", "kind", "message", "source", "status", "resolution"),
     "periods": ("id", "name", "start", "end", "range_kind", "source_start", "source_end"),
@@ -147,6 +147,9 @@ def normalize_record(table, raw, historical=False):
         if record["status"] not in ("scheduled", "completed", "cancelled"):
             raise AppError("课程状态不正确")
         record["series_id"] = record["series_id"] or None
+        record["makeup_for_id"] = record["makeup_for_id"] or None
+        if record["makeup_for_id"] is not None and not isinstance(record["makeup_for_id"], str):
+            raise AppError("补课关联格式不正确")
         record["needs_review"] = bool(record["needs_review"])
     elif table == "payments":
         record["date"] = require_date(record["date"], optional=historical)
@@ -187,6 +190,26 @@ def normalize_record(table, raw, historical=False):
     return record
 
 
+def validate_makeup_links(courses):
+    by_id = {course["id"]: course for course in courses}
+    active = set()
+    for course in courses:
+        source_id = course.get("makeup_for_id")
+        if not source_id:
+            continue
+        source = by_id.get(source_id)
+        if source is None or source_id == course["id"]:
+            raise AppError("补课的原课程关联不完整")
+        if source["student_id"] != course["student_id"]:
+            raise AppError("补课必须与原课程属于同一学生")
+        if course["status"] != "cancelled":
+            if source["status"] != "cancelled":
+                raise AppError("原课程已有补课，请先取消补课再恢复原课程")
+            if source_id in active:
+                raise AppError("原课程已有未取消的补课，请查看现有补课")
+            active.add(source_id)
+
+
 class Store:
     def __init__(self, data_dir):
         self.data_dir = Path(data_dir).expanduser().resolve()
@@ -197,7 +220,7 @@ class Store:
         self.lock = threading.RLock()
         with self.connect() as conn:
             version = conn.execute("PRAGMA user_version").fetchone()[0]
-            if version not in (0, 1, 2, 3):
+            if version not in (0, 1, 2, 3, 4):
                 raise AppError("此数据库版本较新，请使用对应版本程序")
             conn.executescript("""
                 CREATE TABLE IF NOT EXISTS students (
@@ -208,7 +231,8 @@ class Store:
                     id TEXT PRIMARY KEY, student_id TEXT NOT NULL REFERENCES students(id), subject TEXT NOT NULL,
                     date TEXT, start_time TEXT, duration_minutes INTEGER NOT NULL, actual_minutes INTEGER,
                     hourly_rate_cents INTEGER, status TEXT NOT NULL, notes TEXT NOT NULL, series_id TEXT,
-                    source TEXT NOT NULL, needs_review INTEGER NOT NULL);
+                    source TEXT NOT NULL, needs_review INTEGER NOT NULL,
+                    makeup_for_id TEXT REFERENCES courses(id) ON DELETE SET NULL DEFERRABLE INITIALLY DEFERRED);
                 CREATE TABLE IF NOT EXISTS payments (
                     id TEXT PRIMARY KEY, student_id TEXT NOT NULL REFERENCES students(id), date TEXT,
                     kind TEXT NOT NULL, amount_cents INTEGER NOT NULL, notes TEXT NOT NULL, source TEXT NOT NULL);
@@ -221,7 +245,7 @@ class Store:
                 CREATE INDEX IF NOT EXISTS courses_student_date ON courses(student_id,date);
                 CREATE INDEX IF NOT EXISTS courses_series ON courses(series_id,date);
             """)
-            if version < 3:
+            if version < 4:
                 conn.execute("BEGIN IMMEDIATE")
                 if version < 2:
                     columns = {row["name"] for row in conn.execute("PRAGMA table_info(periods)")}
@@ -231,7 +255,10 @@ class Store:
                 columns = {row["name"] for row in conn.execute("PRAGMA table_info(students)")}
                 if "default_duration_minutes" not in columns:
                     conn.execute("ALTER TABLE students ADD COLUMN default_duration_minutes INTEGER NOT NULL DEFAULT 120")
-                conn.execute("PRAGMA user_version=3")
+                columns = {row["name"] for row in conn.execute("PRAGMA table_info(courses)")}
+                if "makeup_for_id" not in columns:
+                    conn.execute("ALTER TABLE courses ADD COLUMN makeup_for_id TEXT REFERENCES courses(id) ON DELETE SET NULL DEFERRABLE INITIALLY DEFERRED")
+                conn.execute("PRAGMA user_version=4")
         self.backup_database(daily=True)
 
     @contextmanager
@@ -377,7 +404,7 @@ class Store:
             with closing(sqlite3.connect(path.as_uri() + "?mode=ro&immutable=1", uri=True)) as conn:
                 conn.row_factory = sqlite3.Row
                 version = conn.execute("PRAGMA user_version").fetchone()[0]
-                if version not in (1, 2, 3):
+                if version not in (1, 2, 3, 4):
                     raise AppError("此本机备份的数据库版本不受支持")
                 doc = self.raw(conn)
             clean = self.validate_backup(doc)
@@ -423,6 +450,7 @@ class Store:
                     raise AppError("课程或缴费缺少学生")
                 if table == "reviews" and row["course_id"] and row["course_id"] not in courses:
                     raise AppError("备份中的课程关联不完整")
+        validate_makeup_links(clean["courses"])
         clean["meta"] = doc.get("meta", {})
         if not isinstance(clean["meta"], dict):
             raise AppError("备份设置格式不正确")
@@ -458,6 +486,8 @@ class Store:
                         if initial and conn.execute(f"SELECT 1 FROM {table} WHERE id=?", (record["id"],)).fetchone():
                             continue
                         self.write(conn, table, record)
+                if initial:
+                    validate_makeup_links([self.decode(row) for row in conn.execute("SELECT * FROM courses")])
                 for key, value in clean["meta"].items():
                     if key not in ("data_dir", "app_version"):
                         if initial and key == "account_settlements":
@@ -483,6 +513,10 @@ class Store:
                     raise AppError("请选择停课范围")
                 if "preview" in body and not isinstance(body["preview"], bool):
                     raise AppError("预览参数必须为布尔值")
+                reason = body.get("reason", "")
+                if not isinstance(reason, str):
+                    raise AppError("请假原因须为文字")
+                reason = reason.strip()
                 if scope == "range":
                     start, end = require_date(body.get("start")), require_date(body.get("end"))
                     if end < start:
@@ -507,7 +541,10 @@ class Store:
                     return {"courses": courses, "count": len(courses)}
                 count = 0
                 for course in courses:
-                    count += conn.execute("UPDATE courses SET status='cancelled' WHERE id=? AND status='scheduled'", (course["id"],)).rowcount
+                    notes = course["notes"]
+                    if reason:
+                        notes = "请假原因：" + reason + ("\n" + notes if notes else "")
+                    count += conn.execute("UPDATE courses SET status='cancelled',notes=? WHERE id=? AND status='scheduled'", (notes, course["id"])).rowcount
                 return {"count": count}
             if table == "courses" and len(parts) == 3 and parts[2] == "copy-week" and method == "POST":
                 target = dt.date.fromisoformat(require_date(body.get("week_start")))
@@ -529,6 +566,12 @@ class Store:
                     raise AppError("预览参数必须为布尔值")
                 rows = [self.decode(r) for r in conn.execute("SELECT * FROM courses WHERE date>=? AND date<? AND status!='cancelled' ORDER BY date,start_time,id", (previous.isoformat(), target.isoformat()))]
                 rows = [c for c in rows if (student_id is None or c["student_id"] == student_id) and (status is None or c["status"] == status)]
+                if "source_ids" in body:
+                    source_ids = body["source_ids"]
+                    if not isinstance(source_ids, list) or any(not isinstance(value, str) for value in source_ids):
+                        raise AppError("请选择要复制的课程")
+                    selected_ids = set(source_ids)
+                    rows = [course for course in rows if course["id"] in selected_ids]
                 keys = {(r["student_id"], r["subject"], r["date"], r["start_time"]) for r in conn.execute("SELECT student_id,subject,date,start_time FROM courses WHERE date>=? AND date<?", (target.isoformat(), (target + dt.timedelta(days=7)).isoformat()))}
                 created, skipped = [], 0
                 for c in rows:
@@ -541,7 +584,10 @@ class Store:
                         skipped += 1
                         continue
                     candidate_id = f"preview:{c['id']}:{date}" if body.get("preview") else new_id()
-                    c.update(id=candidate_id, date=date, status="scheduled", actual_minutes=None, hourly_rate_cents=None, source="", needs_review=False, series_id=None)
+                    source_course_id = c["id"]
+                    c.update(id=candidate_id, date=date, status="scheduled", actual_minutes=None, hourly_rate_cents=None, source="", needs_review=False, series_id=None, makeup_for_id=None)
+                    if body.get("preview"):
+                        c["source_course_id"] = source_course_id
                     keys.add(key)
                     created.append(c)
                 if body.get("preview"):
@@ -611,6 +657,13 @@ class Store:
                     until = dt.date.fromisoformat(require_date(body.get("repeat_until"))) if body.get("repeat_until") else start
                     if until < start or (until - start).days > 366:
                         raise AppError("重复课截止日期需在开始日期后一年内")
+                    if record["makeup_for_id"]:
+                        if until != start:
+                            raise AppError("补课仅安排单次课程")
+                        original = self.find(conn, "courses", record["makeup_for_id"])
+                        if original["status"] != "cancelled":
+                            raise AppError("仅能为已请假或取消的课程安排补课")
+                        validate_makeup_links([self.decode(row) for row in conn.execute("SELECT * FROM courses")] + [record])
                     series = new_id() if until > start else None
                     ids = []
                     while start <= until:
@@ -637,7 +690,7 @@ class Store:
                 return {"ok": True}
             if method != "PATCH":
                 raise AppError("不支持此操作", 405)
-            allowed = set(FIELDS[table]) - {"id", "source", "series_id", "balance_verified"}
+            allowed = set(FIELDS[table]) - {"id", "source", "series_id", "balance_verified", "makeup_for_id"}
             if table == "reviews":
                 allowed = {"status", "resolution"}
             raw = dict(old)
@@ -661,6 +714,8 @@ class Store:
                 raise AppError("请填写核对结果")
             historical = bool(old.get("source")) or (table == "payments" and old["date"] is None)
             record = normalize_record(table, raw, historical=historical)
+            if table == "courses":
+                validate_makeup_links([self.decode(row) for row in conn.execute("SELECT * FROM courses WHERE id!=?", (record["id"],))] + [record])
             if table == "reviews" and record["status"] == "resolved":
                 if record["course_id"]:
                     course = self.find(conn, "courses", record["course_id"])

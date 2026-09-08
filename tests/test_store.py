@@ -29,6 +29,109 @@ class StoreTests(unittest.TestCase):
     def balance(self):
         return next(s for s in self.store.state()["students"] if s["id"] == self.student["id"])["balance_cents"]
 
+    def test_makeup_lifecycle_keeps_original_and_prevents_double_charge(self):
+        original = self.course(notes="原约定")
+        with self.assertRaises(AppError):
+            self.course(makeup_for_id=original)
+        self.call("POST", f"/api/courses/{original}/cancel", {"scope": "one", "reason": "临时有事"})
+        makeup = self.course(date="2026-09-08", makeup_for_id=original)
+        for action in (
+            lambda: self.course(makeup_for_id=original),
+            lambda: self.call("PATCH", f"/api/courses/{original}", {"status": "scheduled"}),
+        ):
+            with self.assertRaises(AppError):
+                action()
+        self.call("PATCH", f"/api/courses/{makeup}", {"status": "completed", "actual_minutes": 60})
+        self.assertEqual(self.balance(), -15000)
+        doc = self.store.export()
+        doc["courses"].reverse()  # Restore must not depend on the source course coming first.
+        self.store.restore(doc)
+        self.assertEqual(self.balance(), -15000)
+        self.assertEqual(next(c for c in self.store.state()["courses"] if c["id"] == makeup)["makeup_for_id"], original)
+        self.call("PATCH", f"/api/courses/{makeup}", {"status": "cancelled"})
+        replacement = self.course(date="2026-09-09", makeup_for_id=original)
+        with self.assertRaises(AppError):
+            self.call("PATCH", f"/api/courses/{makeup}", {"status": "scheduled"})
+        self.call("DELETE", f"/api/courses/{replacement}")
+        self.call("PATCH", f"/api/courses/{original}", {"status": "scheduled"})
+        self.call("DELETE", f"/api/courses/{original}")
+        self.assertIsNone(self.store.state()["courses"][0]["makeup_for_id"])
+        self.assertEqual(self.balance(), 0)
+
+    def test_makeup_rejects_wrong_student_repetition_and_invalid_backup(self):
+        original = self.course()
+        self.call("PATCH", f"/api/courses/{original}", {"status": "cancelled"})
+        other = self.call("POST", "/api/students", {"name": "另一示例"})
+        for body in ({"student_id": other["id"]}, {"repeat_until": "2026-09-21"}):
+            with self.assertRaises(AppError):
+                self.course(makeup_for_id=original, **body)
+        makeup = self.course(makeup_for_id=original)
+        with self.assertRaises(AppError):
+            self.call("PATCH", f"/api/courses/{original}", {"student_id": other["id"]})
+        before = self.store.export()
+        for source in ("missing", makeup):
+            broken = copy.deepcopy(before)
+            next(c for c in broken["courses"] if c["id"] == makeup)["makeup_for_id"] = source
+            with self.assertRaises(AppError):
+                self.store.restore(broken)
+        self.assertEqual(self.store.export()["courses"], before["courses"])
+
+    def test_v3_makeup_migration_is_reentrant_and_keeps_business_data(self):
+        course = self.course()
+        self.call("PATCH", f"/api/courses/{course}", {"status": "completed"})
+        self.call("POST", "/api/payments", {"student_id": self.student["id"], "date": "2026-09-07", "amount_cents": 30000})
+        with self.store.connect() as conn:
+            conn.execute("ALTER TABLE courses DROP COLUMN makeup_for_id")
+            conn.execute("PRAGMA user_version=3")
+        source = self.store.backup_database()
+        with self.store.connect() as conn:
+            before = self.store.raw(conn)
+        migrated = Store(self.tmp.name)
+        expected = copy.deepcopy(before)
+        for row in expected["courses"]:
+            row["makeup_for_id"] = None
+        for _ in range(2):
+            with migrated.connect() as conn:
+                self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 4)
+                self.assertEqual(migrated.raw(conn), expected)
+            migrated = Store(self.tmp.name)
+        migrated.restore_database_backup(source.name)
+        self.assertEqual(migrated.state()["students"][0]["balance_cents"], 0)
+        self.assertIsNone(migrated.state()["courses"][0]["makeup_for_id"])
+
+    def test_copy_selected_sources_and_empty_selection_drop_makeup_link(self):
+        original = self.course(date="2026-09-01")
+        self.call("PATCH", f"/api/courses/{original}", {"status": "cancelled"})
+        makeup = self.course(makeup_for_id=original)
+        ordinary = self.course(date="2026-09-08")
+        request = {"week_start": "2026-09-14", "preview": True}
+        preview = self.call("POST", "/api/courses/copy-week", request)
+        self.assertEqual({c["source_course_id"] for c in preview["created"]}, {makeup, ordinary})
+        for flag in (True, False):
+            self.assertEqual(self.call("POST", "/api/courses/copy-week", dict(request, preview=flag, source_ids=[])), {"created": [], "skipped": 0})
+        selected = self.call("POST", "/api/courses/copy-week", dict(request, source_ids=[makeup]))
+        self.assertEqual(len(selected["created"]), 1)
+        self.assertIsNone(selected["created"][0]["makeup_for_id"])
+        created = self.call("POST", "/api/courses/copy-week", dict(request, preview=False, source_ids=[makeup]))["created"]
+        self.assertEqual(len(created), 1)
+        self.assertIsNone(next(c for c in self.store.state()["courses"] if c["id"] == created[0])["makeup_for_id"])
+        for invalid in (None, "all", [1]):
+            with self.assertRaises(AppError):
+                self.call("POST", "/api/courses/copy-week", dict(request, source_ids=invalid))
+
+    def test_batch_cancel_reason_is_optional_preserves_notes_and_not_duplicated(self):
+        original_notes = "原约定\n【推测日期】旧表日期核对依据"
+        ids = self.call("POST", "/api/courses", {"student_id": self.student["id"], "subject": "数学", "date": "2026-09-07", "start_time": "18:00", "duration_minutes": 120, "notes": original_notes, "repeat_until": "2026-09-14"})["created"]
+        url = f"/api/courses/{ids[0]}/cancel"
+        body = {"scope": "following", "reason": "  临时有事  "}
+        before = self.store.state()["courses"]
+        self.call("POST", url, dict(body, preview=True))
+        self.assertEqual(self.store.state()["courses"], before)
+        self.assertEqual(self.call("POST", url, body), {"count": 2})
+        self.assertEqual(self.call("POST", url, body), {"count": 0})
+        self.assertTrue(all(c["notes"] == "请假原因：临时有事\n" + original_notes for c in self.store.state()["courses"]))
+        self.assertEqual(self.balance(), 0)
+
     def test_regular_duration_validation_and_existing_charges_stay_unchanged(self):
         self.assertEqual(self.student["default_duration_minutes"], 120)
         course = self.course()
@@ -65,7 +168,7 @@ class StoreTests(unittest.TestCase):
         migrated = Store(self.tmp.name)
         with migrated.connect() as conn:
             after = migrated.raw(conn)
-            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 3)
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 4)
         expected = copy.deepcopy(original)
         for student in expected["students"]:
             student["default_duration_minutes"] = 120
@@ -157,7 +260,7 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(listing[0]["filename"], source.name)
         preview = self.store.preview_database_backup(source.name)
         self.assertEqual(preview["counts"], {"students": 1, "courses": 1, "payments": 0, "reviews": 0, "periods": 0})
-        self.assertEqual(preview["schema_version"], 3)
+        self.assertEqual(preview["schema_version"], 4)
         self.assertEqual(self.store.path.read_bytes(), before_live)
         self.assertEqual(self.call("POST", f"/api/backups/{source.name}/restore"), {"ok": True})
         self.assertEqual(len(self.store.state()["students"]), 1)
@@ -385,7 +488,7 @@ class StoreTests(unittest.TestCase):
         committed = self.call("POST", "/api/courses/copy-week", dict(request, preview=False))
         after = next(c for c in self.store.state()["courses"] if c["id"] == committed["created"][0])
         self.assertTrue(after["conflict"])
-        self.assertEqual({k: v for k, v in after.items() if k in candidate and k != "id"}, {k: v for k, v in candidate.items() if k != "id"})
+        self.assertEqual({k: v for k, v in after.items() if k in candidate and k != "id"}, {k: v for k, v in candidate.items() if k not in ("id", "source_course_id")})
         all_preview = self.call("POST", "/api/courses/copy-week", dict(request, student_id="", status=""))
         self.assertEqual(len(all_preview["created"]), 2)
         self.assertEqual(all_preview["skipped"], 2)
@@ -644,7 +747,7 @@ class StoreTests(unittest.TestCase):
             expected = {"id": "old", "name": "已有用户学期", "start": "2026-09-01", "end": "2027-01-31", "range_kind": "term", "source_start": None, "source_end": None}
             self.assertEqual(migrated.state()["periods"], [expected])
             with migrated.connect() as conn:
-                self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 3)
+                self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 4)
             migrated.mutate("PATCH", "/api/periods/old", {"range_kind": "coverage"})
             self.assertEqual(Store(folder).state()["periods"], [dict(expected, range_kind="coverage")])
 

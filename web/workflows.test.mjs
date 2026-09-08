@@ -126,3 +126,36 @@ test('临时一小时不会把十节余额翻倍，常规课长独立且不改�
  assert.equal(regularDuration({default_duration_minutes:180}),180);
  assert.equal(regularDuration({default_duration_minutes:90}),120);
 });
+
+test('重新打开仅恢复学生和栏目，损坏或不可用的存储不影响使用',async()=>{
+ const {readStudentLocation,saveStudentLocation}=await import('./workflows.js');
+ const saved=new Map(),storage={getItem:key=>saved.get(key),setItem:(key,value)=>saved.set(key,value)};
+ assert.deepEqual(readStudentLocation(storage),{studentId:'',tab:'overview'});
+ saveStudentLocation(storage,'s2','courses');
+ assert.deepEqual(readStudentLocation(storage),{studentId:'s2',tab:'courses'});
+ assert.deepEqual(JSON.parse(saved.get('lesson-manager.student-location')),{studentId:'s2',tab:'courses'});
+ saveStudentLocation(storage,'','ledger');
+ saveStudentLocation(storage,'s3','invalid');
+ assert.deepEqual(readStudentLocation(storage),{studentId:'s2',tab:'courses'});
+ for(const value of ['bad json','null','[]','{"studentId":4,"tab":"ledger"}','{"studentId":"s","tab":"invalid"}']){
+  saved.set('lesson-manager.student-location',value);
+  assert.deepEqual(readStudentLocation(storage),{studentId:'',tab:'overview'});
+ }
+ const unavailable={getItem(){throw Error('blocked');},setItem(){throw Error('blocked');}};
+ assert.deepEqual(readStudentLocation(unavailable),{studentId:'',tab:'overview'});
+ assert.doesNotThrow(()=>saveStudentLocation(unavailable,'s','ledger'));
+});
+
+test('补课关联随课程状态变化，取消的补课保留且不会阻止再安排',async()=>{
+ const {makeupLinks}=await import('./workflows.js');
+ const original={...c,status:'cancelled'},cancelled={...c,id:'m1',makeup_for_id:c.id,status:'cancelled'},replacement={...c,id:'m2',makeup_for_id:c.id};
+ const courses=[original,cancelled,replacement];
+ assert.equal(makeupLinks(original,courses).active.id,'m2');
+ assert.equal(makeupLinks(replacement,courses).original.id,c.id);
+ assert.equal(makeupLinks(original,courses).replacements.length,2);
+ replacement.status='completed';
+ assert.equal(makeupLinks(original,courses).active.status,'completed');
+ replacement.status='cancelled';
+ assert.equal(makeupLinks(original,courses).active,undefined);
+ assert.deepEqual(makeupLinks({...c,id:'legacy',notes:'补课：旧备注'},courses),{original:undefined,replacements:[],active:undefined});
+});

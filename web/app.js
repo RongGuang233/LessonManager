@@ -1,14 +1,15 @@
 import {esc,money,hours,today,addDays,monday,minutes,timeLabel,statusText,subjectClass,dateKey,statsFor,accountEntries} from './utils.js';
-import {estimatedFee,regularDuration,attentionFor,plannedChanges,scheduleConflicts,reviewCategory,lessonCredit,impactsCurrentAccount,courseHasEnded,backupSummary,courseChangePayload,contextualStudentId,readPlannerView,savePlannerView} from './workflows.js';
+import {estimatedFee,regularDuration,attentionFor,plannedChanges,scheduleConflicts,reviewCategory,lessonCredit,impactsCurrentAccount,courseHasEnded,backupSummary,courseChangePayload,contextualStudentId,readPlannerView,savePlannerView,readStudentLocation,saveStudentLocation,makeupLinks} from './workflows.js';
 import {buildStatement} from './statement.js';
 import {buildPaymentReceipt} from './receipts.js';
 import {splitHistoryNotes} from './history-notes.js';
 const main=document.querySelector('#main'), dialog=document.querySelector('#dialog');
 let state={students:[],courses:[],payments:[],reviews:[],periods:[],meta:{}}, loaded=false;
 let plannerStorage;try{plannerStorage=window.localStorage;}catch{}
-let route=location.hash.slice(1)||'schedule', anchor=today(), view=readPlannerView(plannerStorage), selectedStudent='', studentSearch='', studentStatus='active';
+const studentLocation=readStudentLocation(plannerStorage);
+let route=location.hash.slice(1)||'schedule', anchor=today(), view=readPlannerView(plannerStorage), selectedStudent=studentLocation.studentId, studentSearch='', studentStatus='active';
 let filterStudent='',filterStatus='',statsMode='month',statsStart=today().slice(0,7)+'-01',statsEnd=today(),statsStudent='';
-let studentAttention='',studentTab='overview',recordMode='recent',recordStart=addDays(today(),-30),recordEnd=today();
+let studentAttention='',studentTab=studentLocation.tab,recordMode='recent',recordStart=addDays(today(),-30),recordEnd=today();
 let reviewStudent='',reviewType='',reviewStatus='pending',reviewPage=0,reviewScope='current',agendaMode='today',showFilters=false;
 let toastTimer;
 const formDrafts=new Map();
@@ -138,22 +139,33 @@ function changePreview(course,changes){
  return `<section class="change-preview"><h3>${rows.length?'将修改 '+rows.length+' 节课程':'没有变动'}</h3><p class="muted small">未改动的字段保留每节课各自的安排。</p>${rows.length?`<div class="preview-list">${rows.map(({old,next,changed})=>`<article><strong>${esc(dateShort(old.date))}</strong><ul>${changed.map(key=>`<li>${labels[key]}：${esc(value(old,key))} → ${esc(value(next,key))}</li>`).join('')}</ul></article>`).join('')}</div>`:''}</section>`;
 }
 async function copyWeekForm(){
- let previewResult=null,previewNumber=0;
+ let previewResult=null,previewNumber=0,selectedIds=new Set();
  const initialStudent=filterStudent,initialStatus=filterStatus;
  const params=()=>{const f=Object.fromEntries(new FormData(dialog.querySelector('form')));return {week_start:monday(anchor),student_id:f.copy_student||'',status:f.copy_status||''};};
- openDialog('复制上周',`<p class="detail-lead">${dateShort(addDays(monday(anchor),-7))}起的一周 → ${dateShort(monday(anchor))}起的一周</p><div class="form-grid">${field('复制学生',`<select name="copy_student">${studentOptions(initialStudent,true)}</select>`)}${field('上周课程状态',`<select name="copy_status">${option('','所有未取消课程',initialStatus)}${option('scheduled','待上课',initialStatus)}${option('completed','已上课',initialStatus)}${option('cancelled','请假 / 取消（不复制）',initialStatus)}</select>`)}</div><div id="copy-preview" aria-live="polite"></div>`,async f=>{
-  if(!previewResult?.created.length)throw new Error('当前范围没有可复制课程。');
-  if(scheduleConflicts(state.courses,previewResult.created).length&&!f.copy_overlap_ack)throw new Error('请先查看冲突并确认继续。');
-  const r=await api('/courses/copy-week','POST',params());await refresh();toast(`已复制 ${r.created.length} 节课，跳过 ${r.skipped} 节`);
- },'复制课程');
+ const selectedCourses=()=>previewResult?.created.filter(c=>selectedIds.has(c.source_course_id))||[];
+ openDialog('复制上周',`<p class="detail-lead">${dateShort(addDays(monday(anchor),-7))}起的一周 → ${dateShort(monday(anchor))}起的一周</p><div class="form-grid">${field('复制学生',`<select name="copy_student">${studentOptions(initialStudent,true)}</select>`)}${field('上周课程状态',`<select name="copy_status">${option('','所有未取消课程',initialStatus)}${option('scheduled','待上课',initialStatus)}${option('completed','已上课',initialStatus)}${option('cancelled','请假 / 取消（不复制）',initialStatus)}</select>`)}</div><div id="copy-preview"></div>`,async f=>{
+  const courses=selectedCourses();
+  if(!courses.length)throw new Error('请至少选择一节课程。');
+  if(scheduleConflicts(state.courses,courses).length&&!f.copy_overlap_ack)throw new Error('请先查看冲突并确认继续。');
+  const r=await api('/courses/copy-week','POST',{...params(),source_ids:[...selectedIds]});await refresh();toast(`已复制 ${r.created.length} 节课，跳过 ${r.skipped} 节`);
+ },'复制所选课程');
  const form=dialog.querySelector('form'),submit=form.querySelector('[type="submit"]');
+ const updateSelection=()=>{
+  const courses=selectedCourses(),conflicts=scheduleConflicts(state.courses,courses),all=form.querySelector('[name="copy_all"]');
+  form.querySelector('#copy-count').textContent=`已选 ${courses.length} 节 · ${new Set(courses.map(c=>c.student_id)).size} 位学生`;
+  if(all){all.checked=!!courses.length&&courses.length===previewResult.created.length;all.indeterminate=!!courses.length&&!all.checked;}
+  form.querySelector('#copy-conflicts').innerHTML=conflicts.length?notice(`<strong>${conflicts.length} 处时间冲突</strong><ul>${conflicts.map(({change,other})=>`<li>${dateShort(change.date)} ${change.start_time} ${esc(studentBy(change.student_id)?.name)} 与 ${esc(studentBy(other.student_id)?.name)} ${other.start_time} 重叠</li>`).join('')}</ul><label class="check"><input name="copy_overlap_ack" type="checkbox">已知晓冲突，仍按此安排</label>`,'warning'):'';
+  submit.textContent=`复制所选 ${courses.length} 节`;submit.disabled=!courses.length;
+ };
  const update=async()=>{
-  const revision=++previewNumber;previewResult=null;submit.disabled=true;form.querySelector('#copy-preview').textContent='正在检查课程…';
+  const revision=++previewNumber;previewResult=null;selectedIds.clear();submit.disabled=true;form.querySelector('#copy-preview').textContent='正在检查课程…';
   try{
    const result=await api('/courses/copy-week','POST',{...params(),preview:true});if(revision!==previewNumber||dialog.querySelector('form')!==form)return;
-   previewResult=result;const conflicts=scheduleConflicts(state.courses,result.created),students=new Set(result.created.map(c=>c.student_id));
-   form.querySelector('#copy-preview').innerHTML=`<section class="change-preview"><h3>${result.created.length?'将复制 '+result.created.length+' 节 · '+students.size+' 位学生':'没有可复制的课程'}</h3>${result.skipped?`<p class="muted small">${result.skipped} 节已有安排或信息不足，自动跳过。</p>`:''}<div class="preview-list">${result.created.map(c=>`<article><strong>${esc(studentBy(c.student_id)?.name)}</strong><span>${dateShort(c.date)} ${c.start_time} · ${esc(c.subject)} · ${hours(c.duration_minutes)}</span></article>`).join('')}</div></section>${conflicts.length?notice(`<strong>${conflicts.length} 处时间冲突</strong><ul>${conflicts.map(({change,other})=>`<li>${dateShort(change.date)} ${change.start_time} ${esc(studentBy(change.student_id)?.name)} 与 ${esc(studentBy(other.student_id)?.name)} ${other.start_time} 重叠</li>`).join('')}</ul><label class="check"><input name="copy_overlap_ack" type="checkbox">已知晓冲突，仍按此安排</label>`,'warning'):''}`;
-   submit.disabled=!result.created.length;
+   previewResult=result;selectedIds=new Set(result.created.map(c=>c.source_course_id));
+   form.querySelector('#copy-preview').innerHTML=`<section class="change-preview"><div class="copy-selection-head"><h3 id="copy-count" aria-live="polite"></h3>${result.created.length?'<label class="check"><input type="checkbox" name="copy_all" checked>全选</label>':''}</div>${!result.created.length?'<p class="muted">没有可复制的课程。</p>':''}${result.skipped?`<p class="muted small">${result.skipped} 节已有安排或信息不足，自动跳过。</p>`:''}<div class="preview-list copy-course-list">${result.created.map(c=>`<label class="copy-course-row"><input type="checkbox" data-copy-id="${esc(c.source_course_id)}" checked><span><strong>${esc(studentBy(c.student_id)?.name)}</strong><span>${dateShort(c.date)} ${c.start_time} · ${esc(c.subject)} · ${hours(c.duration_minutes)}</span></span></label>`).join('')}</div></section><div id="copy-conflicts" aria-live="polite"></div>`;
+   form.querySelectorAll('[data-copy-id]').forEach(el=>el.onchange=()=>{if(el.checked)selectedIds.add(el.dataset.copyId);else selectedIds.delete(el.dataset.copyId);updateSelection();});
+   const all=form.querySelector('[name="copy_all"]');if(all)all.onchange=()=>{form.querySelectorAll('[data-copy-id]').forEach(el=>{el.checked=all.checked;});selectedIds=new Set(all.checked?result.created.map(c=>c.source_course_id):[]);updateSelection();};
+   updateSelection();
   }catch(err){if(revision!==previewNumber||dialog.querySelector('form')!==form)return;form.querySelector('#copy-preview').textContent=err.message;}
  };
  form.querySelectorAll('select').forEach(el=>el.onchange=update);await update();
@@ -177,20 +189,25 @@ function courseForm(c=null,defaults={}){
   if(conflicts.length&&!f.overlap_ack)throw new Error('此安排存在时间重叠，请查看下方冲突并确认继续。');
   const payload=c?courseChangePayload(c,f):{date:f.date||null,start_time:f.start_time||null,duration_minutes:Math.round(Number(f.duration_hours)*60),notes:f.notes};
   if(c){payload.scope=f.scope||'one';if(historical)payload.subject=f.subject;if(f.reviewed)payload.needs_review=false;await mutate(`/courses/${c.id}`,'PATCH',payload);}
-  else{payload.student_id=f.student_id;payload.subject=f.subject;if(f.repeat_until)payload.repeat_until=f.repeat_until;await mutate('/courses','POST',payload,'课程已安排');}
- },'保存',false,`course:${c?.id||item.student_id+':'+item.date+':'+item.start_time}`);
+  else{payload.student_id=f.student_id;payload.subject=f.subject;if(makeup)payload.makeup_for_id=makeup.id;if(f.repeat_until)payload.repeat_until=f.repeat_until;await mutate('/courses','POST',payload,'课程已安排');}
+ },'保存',false,`course:${c?.id||(makeup?'makeup:'+makeup.id:item.student_id+':'+item.date+':'+item.start_time)}`);
  const preview=()=>{const f=Object.fromEntries(new FormData(dialog.querySelector('form'))),changes=plannedChanges(state.courses,c,f),conflicts=scheduleConflicts(state.courses,changes);dialog.querySelector('#schedule-preview').innerHTML=`${c?(f.scope==='following'?changePreview(c,changes):singleChangePreview(c,changes[0])):''}${changes.length>1&&!(c&&f.scope==='following')?notice(`将${c?'修改':'安排'} ${changes.length} 节课：${changes.slice(0,4).map(x=>dateShort(x.date)).join('、')}${changes.length>4?'等':''}。已完成课程保持原记录。`):''}${conflicts.length?notice(`<strong>有 ${conflicts.length} 处时间重叠</strong><ul>${conflicts.slice(0,5).map(({change,other})=>`<li>${dateShort(change.date)} ${change.start_time} 与 ${esc(studentBy(other.student_id)?.name)} ${other.start_time}–${timeLabel(minutes(other.start_time)+displayMinutes(other))} 重叠</li>`).join('')}</ul><label class="check"><input type="checkbox" name="overlap_ack">已知晓重叠，仍按此安排</label>`,'warning'):''}`;};
  dialog.querySelectorAll('[name="date"],[name="start_time"],[name="duration_hours"],[name="repeat_until"],[name="scope"],[name="notes"]').forEach(x=>x.addEventListener('input',preview));
  if(!c)bindStudentPicker(id=>{if(id!==item.student_id){dialog.querySelector('[name="duration_hours"]').value=regularDuration(studentBy(id))/60;item.student_id=id;}const select=dialog.querySelector('[name="subject"]');select.innerHTML=Object.keys(studentBy(id)?.rates||{}).map(s=>option(s,s,select.value)).join('');preview();});preview();
 }
+function makeupHTML(c){
+ const {original,replacements}=makeupLinks(c,state.courses);
+ const link=(course,label)=>`<div class="makeup-row"><span><strong>${label}</strong><span>${dateShort(course.date)} ${course.start_time||''} · ${esc(course.subject)}</span></span>${button('course','查看课程',course.id,'text-button')}</div>`;
+ return original||replacements.length?`<section class="makeup-links" aria-label="补课关联">${original?link(original,'原请假课程'):''}${replacements.map(x=>link(x,x.status==='completed'?'已补课':x.status==='cancelled'?'补课已取消':'已安排补课')).join('')}</section>`:'';
+}
 function courseDetail(c){
- const s=studentBy(c.student_id),completed=c.status==='completed',cancelled=c.status==='cancelled';
+ const s=studentBy(c.student_id),completed=c.status==='completed',cancelled=c.status==='cancelled',makeup=makeupLinks(c,state.courses);
  const fee=completed?feeHTML(c):estimatedFee(c,s)===0?'免费':money(estimatedFee(c,s));
  const duration=completed?c.actual_minutes:c.duration_minutes;
  const timing=c.start_time?c.start_time+(duration!=null?'–'+timeLabel(minutes(c.start_time)+duration):''):'时间待核对';
  const kv=(label,value)=>`<div><dt>${label}</dt><dd>${value}</dd></div>`;
  const rows=kv('状态',statusText(c.status))+(cancelled?'':kv(completed?'实际课时':'计划课时',hours(duration))+(completed&&c.actual_minutes!==c.duration_minutes?kv('原计划',hours(c.duration_minutes)):'')+kv(completed?'本次扣费':'预计课费',fee)+kv(s.balance_verified?'当前余额':'当前已记录余额',balanceHTML(s)));
- openDialog(`${esc(s?.name||'未知学生')} · ${esc(c.subject)}`,`<p class="detail-lead">${dateShort(c.date)} ${timing}${splitHistoryNotes(c.notes).inferred?' <span class="date-estimate">推测日期</span>':''}</p><dl class="key-values">${rows}</dl>${c.conflict?notice('与其他课程时间重叠，请检查排期。','warning'):''}${c.needs_review?notice('历史信息尚未核对完整，待核对费用未计入确定账目。'):''}${historyNoteHTML(c.notes)}${c.source?`<details><summary>原始来源</summary><p class="source">${esc(c.source)}</p></details>`:''}<div class="dialog-actions">${cancelled?button('makeup-course','安排补课',c.id,'primary'):completed?button('correct-course','更正课时 / 费用',c.id):button('complete-course',estimatedFee(c,s)===0?'确认已上课':'记课并扣费',c.id,'primary')}${button('edit-course','调整时间 / 备注',c.id)}${!cancelled?button('payment','记缴费',s.id):''}${button('open-student','学生账页',s.id)}</div><div class="dialog-actions">${cancelled?button('reschedule-course','纠正误取消',c.id,'text-button'):completed?button('undo-course','撤销已上课',c.id,'text-button'):button('cancel-course','请假 / 取消',c.id)+(!c.source?button('delete-course','删除排课',c.id,'text-button danger'):'')}</div>`,null);
+ openDialog(`${esc(s?.name||'未知学生')} · ${esc(c.subject)}`,`<p class="detail-lead">${dateShort(c.date)} ${timing}${splitHistoryNotes(c.notes).inferred?' <span class="date-estimate">推测日期</span>':''}</p><dl class="key-values">${rows}</dl>${makeupHTML(c)}${c.conflict?notice('与其他课程时间重叠，请检查排期。','warning'):''}${c.needs_review?notice('历史信息尚未核对完整，待核对费用未计入确定账目。'):''}${historyNoteHTML(c.notes)}${c.source?`<details><summary>原始来源</summary><p class="source">${esc(c.source)}</p></details>`:''}<div class="dialog-actions">${cancelled?(makeup.active?'':button('makeup-course','安排补课',c.id,'primary')):completed?button('correct-course','更正课时 / 费用',c.id):button('complete-course',estimatedFee(c,s)===0?'确认已上课':'记课并扣费',c.id,'primary')}${button('edit-course','调整时间 / 备注',c.id)}${!cancelled?button('payment','记缴费',s.id):''}${button('open-student','学生账页',s.id)}</div><div class="dialog-actions">${cancelled?(makeup.active?'':button('reschedule-course','纠正误取消',c.id,'text-button')):completed?button('undo-course','撤销已上课',c.id,'text-button'):button('cancel-course','请假 / 取消',c.id)+(!c.source?button('delete-course','删除排课',c.id,'text-button danger'):'')}</div>`,null);
 }
 
 function completeForm(c,correct=false){
@@ -257,7 +274,8 @@ function studentDetail(s){
 }
 function renderStudents(){
  const students=state.students.filter(s=>(!studentStatus||s.status===studentStatus)&&(!studentSearch||(s.name+' '+s.grade).includes(studentSearch))&&(!studentAttention||attentionFor(s,state.courses)===studentAttention));
- if(!students.some(s=>s.id===selectedStudent))selectedStudent=students[0]?.id||'';
+ if(!students.some(s=>s.id===selectedStudent)){selectedStudent=students[0]?.id||'';studentTab='overview';}
+ saveStudentLocation(plannerStorage,selectedStudent,studentTab);
  main.innerHTML=header('','学生账页',`${students.length} 位学生`,button('new-student','添加学生'))+`<div class="attention-filters"><button data-action="attention" data-id="" aria-pressed="${!studentAttention}">全部</button>${['debt','low','unverified'].map(k=>({key:k,count:state.students.filter(s=>(!studentStatus||s.status===studentStatus)&&(!studentSearch||(s.name+' '+s.grade).includes(studentSearch))&&attentionFor(s,state.courses)===k).length})).filter(x=>x.count||x.key===studentAttention).map(x=>`<button data-action="attention" data-id="${x.key}" aria-pressed="${studentAttention===x.key}">${attentionLabels[x.key]} <b>${x.count}</b></button>`).join('')}</div><div class="students-layout"><section class="student-index"><div class="student-controls"><label class="sr-only" for="student-search">搜索姓名或年级</label><input id="student-search" type="search" placeholder="搜索姓名或年级" value="${esc(studentSearch)}"><label class="sr-only" for="student-status">学生状态</label><select id="student-status">${option('','全部状态',studentStatus)}${['active','paused','archived'].map(s=>option(s,statusText(s),studentStatus)).join('')}</select><label class="sr-only" for="student-select">选择学生</label><select id="student-select">${students.map(s=>option(s.id,`${s.name} · ${s.balance_verified&&s.balance_cents<0?'欠费 '+money(-s.balance_cents):money(s.balance_cents)}${s.balance_verified?'':' · 待核对'}`,selectedStudent)).join('')}</select></div><div class="student-list">${students.map(s=>`<button class="student-row ${s.id===selectedStudent?'selected':''}" data-action="select-student" data-id="${esc(s.id)}"><span><strong>${esc(s.name)}</strong>${s.grade||s.status!=='active'?`<small>${[s.grade,s.status!=='active'?statusText(s.status):''].filter(Boolean).map(esc).join(' · ')}</small>`:''}</span><span class="student-balance">${balanceHTML(s)}${attentionFor(s,state.courses)==='low'?'<small class="negative">不足下次课费</small>':''}</span></button>`).join('')||empty('没有符合条件的学生。')}</div></section><section class="student-detail">${selectedStudent?studentDetail(studentBy(selectedStudent)):empty('添加学生后即可安排课程、记缴费。')}</section></div>`;
  document.querySelector('#student-search').oninput=e=>{studentSearch=e.target.value;const pos=e.target.selectionStart;renderStudents();const el=document.querySelector('#student-search');el.focus();el.setSelectionRange(pos,pos);};
  document.querySelector('#student-status').onchange=e=>{studentStatus=e.target.value;render();};
@@ -280,12 +298,12 @@ function paymentReceiptForm(text,title='缴费已记录'){
 }
 async function cancelCourseForm(c){
  let preview=null,revision=0;
- openDialog('请假 / 停课',`<p class="detail-lead">${esc(studentBy(c.student_id)?.name)} · ${dateShort(c.date)}</p>${field('停课范围',`<select name="scope">${option('one','仅本次','one')}${option('range','该学生指定日期内的待上课程','one')}${c.series_id?option('following','本次及以后同系列待上课程','one'):''}</select>`)}<div class="form-grid" id="cancel-dates" hidden>${field('从',input('start','date',c.date||today(),'required'))}${field('至',input('end','date',c.date||today(),'required'))}</div><div id="cancel-preview" aria-live="polite"></div>`,async()=>{
+ openDialog('请假 / 停课',`<p class="detail-lead">${esc(studentBy(c.student_id)?.name)} · ${dateShort(c.date)}</p>${field('停课范围',`<select name="scope">${option('one','仅本次','one')}${option('range','该学生指定日期内的待上课程','one')}${c.series_id?option('following','本次及以后同系列待上课程','one'):''}</select>`)}<div class="form-grid" id="cancel-dates" hidden>${field('从',input('start','date',c.date||today(),'required'))}${field('至',input('end','date',c.date||today(),'required'))}</div>${field('请假原因（选填）','<textarea name="reason" rows="2" placeholder="例如：临时有事，下周再约"></textarea>')}<div id="cancel-preview" aria-live="polite"></div>`,async()=>{
   if(!preview?.count)throw new Error('没有可停课的课程。');
   const result=await api(`/courses/${c.id}/cancel`,'POST',params());await refresh();toast(`已停课 ${result.count} 节，不扣课费`);
  },'确认停课');
  const form=dialog.querySelector('form'),submit=form.querySelector('[type="submit"]');
- const params=()=>{const f=Object.fromEntries(new FormData(form));return {scope:f.scope,...(f.scope==='range'?{start:f.start,end:f.end}:{})};};
+ const params=()=>{const f=Object.fromEntries(new FormData(form));return {scope:f.scope,reason:f.reason||'',...(f.scope==='range'?{start:f.start,end:f.end}:{})};};
  const update=async()=>{const n=++revision;preview=null;submit.disabled=true;const range=form.querySelector('[name="scope"]').value==='range';form.querySelector('#cancel-dates').hidden=!range;form.querySelectorAll('#cancel-dates input').forEach(el=>el.disabled=!range);const body=params(),area=form.querySelector('#cancel-preview');area.textContent='正在检查课程…';
   try{const result=await api(`/courses/${c.id}/cancel`,'POST',{...body,preview:true});if(n!==revision||dialog.querySelector('form')!==form)return;preview=result;
    area.innerHTML=`<section class="change-preview"><h3>${result.count?'将停课 '+result.count+' 节':'没有可停课的课程'}</h3><p class="muted small">${body.scope==='range'?'包含该学生在此日期范围内的所有科目和排课。':''}已完成课程保留，停课不扣费。</p><div class="preview-list">${result.courses.map(x=>`<article><strong>${dateShort(x.date)} ${x.start_time||'时间待定'}</strong><span>${esc(x.subject)} · ${hours(x.duration_minutes)}</span></article>`).join('')}</div></section>`;submit.disabled=!result.count;
@@ -396,7 +414,7 @@ async function handleAction(action,id,el){
  case'all-student-records':studentTab='ledger';recordMode='all';recordKind='';recordLimit=30;statsOrigin='';render();break;
  case'student-tab':studentTab=id;recordLimit=30;render();break;case'more-records':recordLimit+=30;render();break;
  case'attention':studentAttention=id||'';render();break;
- case'makeup-course':if(c?.status==='cancelled')courseForm(null,{student_id:c.student_id,subject:c.subject,date:'',start_time:c.start_time||'18:00',duration_minutes:regularDuration(studentBy(c.student_id)),notes:`补课：原 ${c.date||'日期待核对'} ${c.subject} 请假课程。`,makeupFor:c});break;
+ case'makeup-course':if(c?.status==='cancelled')courseForm(null,{student_id:c.student_id,subject:c.subject,date:'',start_time:c.start_time||'18:00',duration_minutes:regularDuration(studentBy(c.student_id)),notes:'',makeupFor:c});break;
  case'student-course':courseForm(null,{student_id:id,date:today()});break;
  case'payment':paymentForm(id);break;
  case'payment-receipt':{const p=state.payments.find(p=>p.id===id),text=buildPaymentReceipt(p,studentBy(p?.student_id),state.courses);if(text)paymentReceiptForm(text,'缴费回执');break;}case'edit-payment':{const p=state.payments.find(p=>p.id===id);paymentForm(p.student_id,p);break;}
