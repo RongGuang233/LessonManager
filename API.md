@@ -2,6 +2,8 @@
 
 同源 JSON API，金额单位分，时长单位分钟。日期 YYYY-MM-DD，开始时间 HH:MM；历史缺失值可为 null。新课实际时长为正整数小时；历史例外保留。无登录、无远程同步。
 
+POST/PATCH/DELETE 带请求体时 Content-Type 必须是 application/json，否则返回 400 {error:"请求格式必须是 JSON"}；无请求体（如 DELETE /api/payments/:id）按空对象 {} 处理，不要求 Content-Type。
+
 GET /api/state → {students,courses,payments,reviews,periods,meta}
 
 - student: {id,name,status:"active"|"paused"|"archived",grade,notes,rates:{"数学":15000,"物理":15000},balance_verified:boolean,default_duration_minutes:120,balance_cents,completed_minutes,paid_cents,charged_cents,pending_count,settlement:null|{confirmed_on,balance_cents,note,course_ids,payment_ids}}

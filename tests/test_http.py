@@ -132,6 +132,29 @@ class HttpTests(unittest.TestCase):
         period = self.request(f"/api/periods/{period['id']}", "PATCH", {"range_kind": "term", "start": "2026-09-01", "end": "2027-01-31"})
         self.assertEqual((period["range_kind"], period["source_start"], period["source_end"]), ("term", "2026-09-07", "2026-10-28"))
 
+    def test_bodyless_delete_and_json_content_type_over_http(self):
+        student = self.request("/api/students", "POST", {"name": "删除示例"})
+        payment = self.request("/api/payments", "POST", {"student_id": student["id"], "date": "2026-09-08", "amount_cents": 50000})
+        course = self.request("/api/courses", "POST", {"student_id": student["id"], "subject": "数学", "date": "2026-09-07", "start_time": "18:00", "duration_minutes": 120})["created"][0]
+        # 界面删除缴费、排课、学期时不带请求体，也不发送 Content-Type，应按空对象处理。
+        with urlopen(Request(f"{self.base}/api/payments/{payment['id']}", method="DELETE")) as response:
+            self.assertEqual(json.load(response), {"ok": True})
+        with urlopen(Request(f"{self.base}/api/courses/{course}", method="DELETE")) as response:
+            self.assertEqual(json.load(response), {"ok": True})
+        self.assertEqual(self.request("/api/state")["payments"], [])
+        # 带请求体但不是 JSON 仍然拒绝，空对象视为 "{}" 交给业务校验。
+        for headers, data in (({"Content-Type": "application/x-www-form-urlencoded"}, b"name=x"), ({"Content-Type": "application/json"}, b"[1]")):
+            with self.subTest(headers=headers), self.assertRaises(HTTPError) as caught:
+                urlopen(Request(self.base + "/api/students", data=data, method="POST", headers=headers))
+            self.assertEqual(caught.exception.code, 400)
+            with caught.exception as response:
+                error = json.load(response)["error"]
+            self.assertIn("对象" if data.startswith(b"[") else "JSON", error)
+        with self.assertRaises(HTTPError) as caught:
+            urlopen(Request(self.base + "/api/payments", data=b"", method="POST", headers={"Content-Type": "application/json"}))
+        with caught.exception as response:
+            self.assertEqual(response.status, 400)
+
     def test_historical_review_cannot_hide_missing_date_over_http(self):
         student = self.request("/api/students", "POST", {"name": "历史核对示例"})
         backup = self.request("/api/backup")

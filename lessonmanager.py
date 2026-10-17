@@ -823,9 +823,10 @@ def make_handler(store):
                 length = int(self.headers.get("Content-Length", "0"))
                 if length > 20_000_000:
                     raise AppError("文件过大，请选择本系统 JSON 备份")
-                if not self.headers.get("Content-Type", "").startswith("application/json"):
+                raw = self.rfile.read(length) if length else b""
+                if raw.strip() and not self.headers.get("Content-Type", "").startswith("application/json"):
                     raise AppError("请求格式必须是 JSON")
-                body = json.loads(self.rfile.read(length) or b"{}")
+                body = json.loads(raw or b"{}")
                 if not isinstance(body, dict):
                     raise AppError("请求内容必须是对象")
                 result = store.mutate(self.command, urlparse(self.path).path, body)
