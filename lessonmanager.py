@@ -18,7 +18,7 @@ from urllib.request import urlopen
 import webbrowser
 from contextlib import closing, contextmanager
 
-VERSION = "1.9.2"
+VERSION = "1.10.0"
 ROOT = Path(__file__).resolve().parent
 DEFAULT_DATA_DIR = Path.home() / "Library" / "Application Support" / "LessonManager"
 TABLES = ("students", "courses", "payments", "reviews", "periods")
@@ -772,7 +772,9 @@ class Store:
             return record
 
 
-def make_handler(store):
+def make_handler(store, tuition_publisher=None):
+    from tuition_sync import Publisher, SyncError
+    publisher = tuition_publisher if tuition_publisher is not None else Publisher(store)
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *_args):
             pass  # 不在终端打印姓名、请求内容或业务数据。
@@ -793,6 +795,8 @@ def make_handler(store):
             try:
                 if path == "/api/health":
                     return self.send_json({"app": "LessonManager", "version": VERSION})
+                if path == "/api/tuition-sync":
+                    return self.send_json(publisher.status())
                 if path == "/api/state":
                     return self.send_json(store.state())
                 if path == "/api/backup":
@@ -817,6 +821,8 @@ def make_handler(store):
                 self.wfile.write(content)
             except AppError as exc:
                 self.send_json({"error": str(exc)}, exc.status)
+            except SyncError as exc:
+                self.send_json({"error": str(exc)}, 400)
 
         def change(self):
             try:
@@ -829,10 +835,20 @@ def make_handler(store):
                 body = json.loads(raw or b"{}")
                 if not isinstance(body, dict):
                     raise AppError("请求内容必须是对象")
-                result = store.mutate(self.command, urlparse(self.path).path, body)
+                path = urlparse(self.path).path
+                if self.command == "POST" and path == "/api/tuition-sync":
+                    result = publisher.configure(body)
+                elif self.command == "POST" and path == "/api/tuition-sync/publish":
+                    result = publisher.publish()
+                elif self.command == "POST" and path == "/api/tuition-sync/pairing":
+                    result = publisher.pairing()
+                else:
+                    result = store.mutate(self.command, path, body)
                 self.send_json(result)
             except AppError as exc:
                 self.send_json({"error": str(exc)}, exc.status)
+            except SyncError as exc:
+                self.send_json({"error": str(exc)}, 400)
             except (ValueError, TypeError, KeyError):
                 self.send_json({"error": "输入内容不完整或格式不正确"}, 400)
             except sqlite3.IntegrityError:

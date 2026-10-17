@@ -1,6 +1,6 @@
 #!/bin/zsh
 cd "${0:A:h}" || exit 1
-for candidate in /opt/homebrew/bin/python3 /usr/local/bin/python3 /usr/bin/python3; do
+for candidate in "$PWD/.venv/bin/python" /opt/homebrew/bin/python3 /usr/local/bin/python3 /usr/bin/python3; do
   if [[ -x "$candidate" ]]; then
     exec "$candidate" lessonmanager.py --open
   fi

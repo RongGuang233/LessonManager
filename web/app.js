@@ -1,3 +1,4 @@
+import {newTuitionKey,publicationMessage} from './tuition-sync.js';
 import {esc,money,hours,today,addDays,monday,minutes,timeLabel,statusText,subjectClass,dateKey,statsFor,accountEntries} from './utils.js';
 import {estimatedFee,regularDuration,attentionFor,plannedChanges,scheduleConflicts,reviewCategory,lessonCredit,impactsCurrentAccount,courseHasEnded,backupSummary,courseChangePayload,contextualStudentId,readPlannerView,savePlannerView,readStudentLocation,saveStudentLocation,makeupLinks,recordDateMatches,statementRange,studentMatchesSearch,archivedSearchMatches} from './workflows.js';
 import {buildStatement} from './statement.js';
@@ -71,7 +72,7 @@ function openDialog(title,body,onSubmit,footer='保存',wide=false,draftKey=''){
  });
 }
 function confirmAction(title,content,action,label='确认'){openDialog(title,content,action,label);}
-function header(_eyebrow,title,subtitle,actions=''){return `<header class="page-head"><div><h1>${title}</h1><p class="subtitle">${subtitle}</p></div><div class="actions">${route==='settings'||(route==='students'&&selectedStudent)?'':button('global-payment','＋ 记缴费')}${actions}</div></header>`;}
+function header(_eyebrow,title,subtitle,actions=''){return `<header class="page-head"><div><h1>${title}</h1><p class="subtitle">${subtitle}</p></div><div class="actions">${route==='settings'||(route==='students'&&selectedStudent)?'':button('global-payment','＋ 记缴费')}${button('publish-tuition','发布学费余额')}${actions}</div></header>`;}
 function render(){
  const calendar=main.querySelector('.calendar-scroll');if(calendar)calendarPositions.set(calendar.dataset.key,calendar.scrollTop);
  document.querySelectorAll('[data-nav]').forEach(a=>{a.classList.toggle('active',a.dataset.nav===route||(route==='reviews'&&a.dataset.nav==='settings'));if(a.dataset.nav===route)a.setAttribute('aria-current','page');else a.removeAttribute('aria-current');});
@@ -406,7 +407,7 @@ function renderSettings(){
  const current=relevant[0]||periods.find(p=>p.start>=today());
  const former=periods.filter(p=>p.id!==current?.id);
  const row=p=>`<div class="setting-row"><div><strong>${esc(p.name.replace(/课表$/,''))}</strong><small>${p.range_kind==='coverage'?'学期日期待定 · 已录入 ':''}${p.start} — ${p.end}</small>${p.range_kind!=='coverage'&&p.source_start?`<small>原表覆盖 ${p.source_start} — ${p.source_end}</small>`:''}</div><div class="actions">${button('edit-period',p.range_kind==='coverage'?'设置学期日期':'编辑',p.id,'text-button')}<details class="row-more"><summary aria-label="${esc(p.name)}更多操作">更多</summary>${button('delete-period','删除范围',p.id,'text-button danger')}</details></div></div>`;
- main.innerHTML=header('','设置','学期与本地备份')+`<section class="settings-section"><div class="section-title"><h2>数据与备份</h2></div><div class="settings-content"><dl class="key-values"><div><dt>最近备份</dt><dd>${esc(readableTime(state.meta.last_backup_at))}</dd></div></dl><div class="actions">${button('backup','下载备份','','primary')}${button('local-backups','从本机备份恢复')}${button('restore','从备份文件恢复')}</div><details class="data-location compact-details"><summary>本地数据位置</summary><p class="path">${esc(state.meta.data_dir)}</p></details></div></section><section class="settings-section"><div class="section-title"><h2>当前学期</h2></div><div class="settings-content">${current?row(current):'<p class="muted">暂无当前学期。</p>'}${pendingPeriods.map(p=>`<div class="setting-row"><div><strong>${esc(p.name)}</strong><small>日期暂未确定</small></div><div class="actions">${button('edit-period','设置学期日期',p.id,'text-button')}${button('delete-period','删除',p.id,'text-button')}</div></div>`).join('')}${button('new-period','添加学期')}${former.length?`<details class="past-periods"><summary>其他学期与历史范围 · ${former.length} 个</summary>${former.map(row).join('')}</details>`:''}</div></section><section class="settings-section"><div class="section-title"><h2>历史资料</h2></div><div class="settings-content">${button('history-reviews','历史核对')}${state.reviews.some(r=>r.status==='pending'&&impactsCurrentAccount(r,state.students,state.courses))?'<p class="small negative">有待核对事项影响当前账目</p>':''}</div></section><p class="version">课时簿 ${esc(state.meta.app_version)} · 本地使用</p>`;
+ main.innerHTML=header('','设置','学期与本地备份')+`<section class="settings-section"><div class="section-title"><h2>数据与备份</h2></div><div class="settings-content"><dl class="key-values"><div><dt>最近备份</dt><dd>${esc(readableTime(state.meta.last_backup_at))}</dd></div></dl><div class="actions">${button('backup','下载备份','','primary')}${button('local-backups','从本机备份恢复')}${button('restore','从备份文件恢复')}</div><details class="data-location compact-details"><summary>本地数据位置</summary><p class="path">${esc(state.meta.data_dir)}</p></details></div></section><section class="settings-section"><div class="section-title"><h2>当前学期</h2></div><div class="settings-content">${current?row(current):'<p class="muted">暂无当前学期。</p>'}${pendingPeriods.map(p=>`<div class="setting-row"><div><strong>${esc(p.name)}</strong><small>日期暂未确定</small></div><div class="actions">${button('edit-period','设置学期日期',p.id,'text-button')}${button('delete-period','删除',p.id,'text-button')}</div></div>`).join('')}${button('new-period','添加学期')}${former.length?`<details class="past-periods"><summary>其他学期与历史范围 · ${former.length} 个</summary>${former.map(row).join('')}</details>`:''}</div></section><section class="settings-section"><div class="section-title"><h2>历史资料</h2></div><div class="settings-content">${button('history-reviews','历史核对')}${state.reviews.some(r=>r.status==='pending'&&impactsCurrentAccount(r,state.students,state.courses))?'<p class="small negative">有待核对事项影响当前账目</p>':''}</div></section><section class="settings-section"><div class="section-title"><h2>订阅簿学费同步</h2></div><div class="settings-content"><p class="muted">手动发布学生余额；本机加密后上传，课程明细和备注不离开本机。</p><div class="actions">${button('tuition-config','连接设置')}${button('tuition-pairing','查看手机配对密钥')}</div></div></section><p class="version">课时簿 ${esc(state.meta.app_version)} · 本地使用</p>`;
 }
 function statementForm(id){
  let doc=null;
@@ -425,6 +426,9 @@ function openStudent(id,tab='overview'){selectStudent(id,tab);studentSearch='';s
 async function handleAction(action,id,el){
  const c=courseBy(id);
  switch(action){
+ case'tuition-config':await tuitionConfigForm();break;
+ case'tuition-pairing':await tuitionPairingForm();break;
+ case'publish-tuition':await publishTuition(el);break;
  case'all-reviews':reviewScope='all';reviewStudent='';reviewType='';reviewPage=0;location.hash='reviews';break;
  case'global-payment':paymentForm(contextualStudentId(route,{selectedStudent,filterStudent,statsStudent},state.students));break;
  case'new-course':courseForm();break;case'day-course':courseForm(null,{date:id});break;case'slot':courseForm(null,{date:el.dataset.date,start_time:el.dataset.time});break;
@@ -514,4 +518,24 @@ function restoreForm(){
    dialog.querySelector('#restore-confirm').hidden=false;submit.disabled=false;
   }catch(e){if(fileInput.files[0]!==file)return;error.textContent=e instanceof SyntaxError?'文件不是有效的 JSON 备份。':e.message;error.hidden=false;}
  };
+}
+
+
+async function tuitionConfigForm(){
+ const config=await api('/tuition-sync');
+ openDialog('学费同步连接',`<p>凭据保存到这台 Mac 的钥匙串，不包含在课时簿备份中。保存连接不会访问服务器。</p><div class="form-grid">${field('完整 HTTPS 接口地址',input('endpoint','url',config.endpoint,'required placeholder="https://example.com/tuition" autocomplete="off"'))}${field('上传令牌',input('uploadToken','password','',`${config.configured?'':'required'} autocomplete="new-password" placeholder="${config.configured?'留空保留已有令牌':'服务器的上传令牌'}"`))}${field('共享加密密钥',input('key','password','',`${config.configured?'':'required'} autocomplete="new-password" placeholder="${config.configured?'留空保留已有密钥':'生成后，在手机上填入相同密钥'}"`))}<button type="button" id="generate-tuition-key">生成新的加密密钥</button></div><p class="small">密钥更换后手机也需重新配对。手机使用独立的下载令牌。</p>${config.lastPublishedAt?`<p>上次发布：${esc(readableTime(config.lastPublishedAt))}</p>`:''}`,async f=>{await api('/tuition-sync','POST',f);toast('学费同步连接已保存');});
+ dialog.querySelector('#generate-tuition-key').onclick=()=>{const field=dialog.querySelector('[name="key"]');field.value=newTuitionKey();field.type='text';};
+}
+
+async function tuitionPairingForm(){
+ const pairing=await api('/tuition-sync/pairing','POST');
+ openDialog('手机配对',`<p>在订阅簿“学费同步”填写此地址、密钥，以及服务器的下载令牌。密钥只保存在两台设备，不传给服务器。</p>${field('接口地址',input('endpoint','text',pairing.endpoint,'readonly'))}${field('共享加密密钥',input('key','text',pairing.key,'readonly autocomplete="off"'))}<p class="small">此处包含私密密钥，完成后关闭。</p>`,null);
+}
+
+let tuitionPublishing=false;
+async function publishTuition(el){
+ if(tuitionPublishing)return;
+ tuitionPublishing=true;if(el)el.disabled=true;
+ try{const result=await api('/tuition-sync/publish','POST');toast(publicationMessage(result));}
+ finally{tuitionPublishing=false;if(el)el.disabled=false;}
 }

@@ -1,6 +1,6 @@
 # 本地接口
 
-同源 JSON API，金额单位分，时长单位分钟。日期 YYYY-MM-DD，开始时间 HH:MM；历史缺失值可为 null。新课实际时长为正整数小时；历史例外保留。无登录、无远程同步。
+同源 JSON API，金额单位分，时长单位分钟。日期 YYYY-MM-DD，开始时间 HH:MM；历史缺失值可为 null。新课实际时长为正整数小时；历史例外保留。本机使用，无登录；可选手动发布加密学费余额摘要，业务账本仍保存在本机。
 
 POST/PATCH/DELETE 带请求体时 Content-Type 必须是 application/json，否则返回 400 {error:"请求格式必须是 JSON"}；无请求体（如 DELETE /api/payments/:id）按空对象 {} 处理，不要求 Content-Type。
 
@@ -47,3 +47,12 @@ POST /api/backups/:filename/restore {} → {ok:true}；只接受上述目录内�
 导入器输出 {schema_version:1,students:[],courses:[],payments:[],reviews:[],periods:[],meta:{imported_at,source_summary}}。
 只输出上述实体基础字段，不输出计算字段。学生必须有唯一id。课程duration_minutes默认为120，未知实际时长actual_minutes=null，已完成但未知时长/单价/疑似笔误的费用不参与确定账目，needs_review=true。每个学生balance_verified=false，直到有依据地核对余额；已结束学习学生可按明确确认结清，在读学生必须保留实际余额或欠费。重复导入相同来源课程须有稳定id（可用源文件+单元格作为身份，与宿主绝对路径无关）。历史英语保留。
 原始数据来源优先级：学期/假期表 > 课时表.xlsx；同表下方学生明细 > 上方排班；黄色已完成且已扣费，无色取消/未上且不扣费。上方只补漏，不能覆盖下方。outputs派生文件不导入。缺失日期/金额不伪造，疑点进入reviews。不重复累计跨期余额和此前缴费。
+
+### 手动学费同步（可选）
+
+- `GET /api/tuition-sync`：连接地址、是否配置、上次成功发布时间；不返回令牌或密钥。
+- `POST /api/tuition-sync`：`endpoint`（完整 HTTPS 地址）、`uploadToken`、`key`（32 字节 Base64）；已配置时密钥/令牌留空保留。仅保存到 macOS 钥匙串，不联网，不进入账本备份。
+- `POST /api/tuition-sync/pairing`：用户主动查看手机配对信息，返回 `endpoint` 和共享 `key`，不返回上传令牌。
+- `POST /api/tuition-sync/publish`：无业务参数，本机按当前结算结果形成最小摘要、AES-256-GCM 加密后 PUT；返回 `publishedAt/students/unverified/statusSaved`。单次发布串行，20 秒请求超时，不自动重试。异常以 JSON `error` 返回。
+
+详情见 [学费同步说明](docs/tuition-sync.md)。

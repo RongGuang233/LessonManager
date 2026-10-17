@@ -1,0 +1,2 @@
+# Optional runtime dependency for manual tuition publishing; Apache-2.0 OR BSD-3-Clause.
+cryptography>=46,<51

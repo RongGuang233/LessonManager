@@ -16,7 +16,7 @@ Mac 本地课时与课费管理网站。以周课表、学生账目和课后确�
 python3 lessonmanager.py --open
 ```
 
-网页运行不需要第三方依赖、Node.js 或云端账号。
+普通记课不需要第三方依赖、Node.js 或云端账号；可选学费同步需要另行安装加密依赖。
 
 ## 界面预览
 
@@ -76,9 +76,13 @@ python3 lessonmanager.py --import '/仓库之外/导入结果.json' --import-onl
 ## 验证
 
 ```sh
-python3 -m unittest discover -s tests -v
+.venv/bin/python -m unittest discover -s tests -v
 ```
 
 账务测试覆盖分科计价、负余额、补缴、单价冻结、撤销扣费、固定周课、重复复制、备份恢复及历史缺失值。Excel 测试使用临时生成的虚构表格。
 
-运行全套测试需先安装可选的 Excel 导入依赖；前端纯函数测试可另用 `node --test web/utils.test.mjs web/workflows.test.mjs web/statement.test.mjs web/receipts.test.mjs web/history-notes.test.mjs` 运行，Node 仅用于此项开发测试。
+运行全套测试前，在项目虚拟环境安装 `requirements-import.txt` 和 `requirements-sync.txt` 中的可选依赖。测试使用临时账本和内存凭据，不读取业务数据库或 macOS 钥匙串。前端纯函数测试可另用 `node --test web/*.test.mjs` 运行，Node 仅用于此项开发测试。
+
+## 订阅簿学费同步（可选）
+
+页面右上角“发布学费余额”可手动发布经过本机加密的学生余额摘要；手机再手动刷新。配置入口在设置 → 订阅簿学费同步。此功能需要可选加密依赖和用户确认后部署的 HTTPS 中转服务；不会自动连接服务器或修改课程。安装、配对及统计口径见 [学费同步说明](docs/tuition-sync.md)。
