@@ -188,3 +188,15 @@ test('归档搜索只在非空查询和其他状态筛选下提示，不把筛�
  assert.deepEqual(archivedSearchMatches(students,' 示例乙 ','active').map(s=>s.id),['old']);
  for(const [query,status] of [['','active'],['  ','active'],['示例乙',''],['示例乙','archived'],['不存在','active']])assert.deepEqual(archivedSearchMatches(students,query,status),[]);
 });
+
+
+test('归档学生不提示下次课费或估算可上课节数，保留欠费和待核对事实',async()=>{
+ const {lessonCredit}=await import('./workflows.js');
+ const archived={...student,status:'archived'};
+ assert.equal(attentionFor(archived,[c],'2026-09-07'),'normal');
+ assert.equal(lessonCredit(archived,[c],'2026-09-07'),null);
+ assert.equal(lessonCredit({...archived,rates:{数学:15000}},[],'2026-09-07'),null);
+ assert.equal(attentionFor({...archived,balance_cents:-1},[c],'2026-09-07'),'debt');
+ assert.equal(attentionFor({...archived,balance_verified:false},[c],'2026-09-07'),'unverified');
+ assert.equal(attentionFor(student,[c],'2026-09-07'),'low');
+});

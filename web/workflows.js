@@ -7,6 +7,7 @@ export function estimatedFee(course, student) {
 export function attentionFor(student, courses, date = today()) {
   if (!student.balance_verified) return 'unverified';
   if (student.balance_cents < 0) return 'debt';
+  if (student.status === 'archived') return 'normal';
   const next = courses.filter(c => c.student_id === student.id && c.status === 'scheduled' && c.date >= date)
     .sort((a,b) => a.date.localeCompare(b.date) || (a.start_time || '').localeCompare(b.start_time || ''))[0];
   const expected = next ? estimatedFee(next, student) : null;
@@ -130,7 +131,7 @@ export function regularDuration(student) {
   return Number.isInteger(value)&&value>=60&&value<=1440&&value%60===0?value:120;
 }
 export function lessonCredit(student, courses, date = today()) {
-  if (!student.balance_verified || student.balance_cents < 0) return null;
+  if (student.status === 'archived' || !student.balance_verified || student.balance_cents < 0) return null;
   const next = courses.filter(c => c.student_id === student.id && c.status === 'scheduled' && c.date >= date)
     .sort((a,b) => a.date.localeCompare(b.date) || (a.start_time || '').localeCompare(b.start_time || ''))[0];
   const rates = Object.entries(student.rates || {}).filter(([,rate]) => rate != null);
